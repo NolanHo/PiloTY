@@ -42,6 +42,29 @@ def test_mcp_tool_shapes_include_status_and_prompt(tmp_path):
         mcp_server.QUIESCENCE_MS = prev
 
 
+def test_poll_output_timeout_is_capped(tmp_path):
+    session_id = "test_poll_output_timeout_cap"
+    try:
+        asyncio.run(mcp_server.create_session(session_id=session_id, cwd=str(tmp_path)))
+        session = mcp_server.session_manager.sessions[session_id]
+
+        captured: dict[str, float] = {}
+
+        def patched_poll_output(*args, **kwargs):
+            captured["timeout"] = float(kwargs.get("timeout"))
+            return {"status": "timeout", "output": "", "output_truncated": False, "dropped_bytes": 0}
+
+        session.poll_output = patched_poll_output  # type: ignore[method-assign]
+
+        asyncio.run(mcp_server.poll_output(session_id=session_id, timeout=999999.0))
+        assert captured["timeout"] == mcp_server.MAX_TOOL_TIMEOUT_S
+    finally:
+        try:
+            asyncio.run(mcp_server.terminate(session_id))
+        except Exception:
+            pass
+
+
 def test_mcp_terminate_is_final(tmp_path):
     session_id = "test_mcp_terminate_final"
     try:

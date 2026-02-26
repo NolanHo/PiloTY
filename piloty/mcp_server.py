@@ -33,6 +33,7 @@ from .core import PTY, default_session_log_dir
 logger = logging.getLogger(__name__)
 
 QUIESCENCE_MS = int(os.getenv("PILOTY_QUIESCENCE_MS", "1000"))
+MAX_TOOL_TIMEOUT_S = 300.0
 
 # FastMCP's generated argument models inherit from ArgModelBase. By default, extra
 # tool arguments are silently ignored by pydantic. Reject unknown keys to avoid
@@ -985,6 +986,8 @@ async def poll_output(
     silent for PILOTY_QUIESCENCE_MS (default 1000ms). Returns empty output only
     when `timeout` elapses without any output.
 
+    The effective timeout is capped at 300 seconds.
+
     If you need to wait for a shell prompt (e.g., after SSH), use expect_prompt().
     """
     if session_id in getattr(session_manager, "_terminated", set()):
@@ -1019,6 +1022,9 @@ async def poll_output(
             "dropped_bytes": 0,
             "state_reason": "",
         }
+
+    if timeout > MAX_TOOL_TIMEOUT_S:
+        timeout = MAX_TOOL_TIMEOUT_S
 
     result = await asyncio.to_thread(
         session.poll_output,
