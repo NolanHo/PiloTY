@@ -51,6 +51,10 @@ ESC_RE = re.compile(
 )
 
 
+def _clamp_tool_timeout(timeout: float) -> float:
+    return min(timeout, MAX_TOOL_TIMEOUT_S)
+
+
 def _maybe_strip_ansi(text: str, *, strip_ansi: bool) -> str:
     if not strip_ansi:
         return text
@@ -654,6 +658,8 @@ async def run(
     Quiescence: reads until the PTY is silent for PILOTY_QUIESCENCE_MS (default 1000ms),
     or until `timeout` seconds elapse.
 
+    The effective timeout is capped at 300 seconds.
+
     Common SSH pattern:
     - create_session(session_id, cwd)
     - run(session_id, "ssh host", timeout=...)
@@ -691,6 +697,8 @@ async def run(
             "dropped_bytes": 0,
             "state_reason": "",
         }
+
+    timeout = _clamp_tool_timeout(timeout)
 
     # Send command with newline
     result = await asyncio.to_thread(session.type, command + "\n", timeout=timeout, quiescence_ms=QUIESCENCE_MS)
@@ -730,6 +738,8 @@ async def send_input(
     """Send raw input to a stateful terminal session (no newline added).
 
     Requires an existing session created via `create_session(session_id, cwd)`.
+
+    The effective timeout is capped at 300 seconds.
     """
     if session_id in getattr(session_manager, "_terminated", set()):
         return {
@@ -763,6 +773,8 @@ async def send_input(
             "dropped_bytes": 0,
             "state_reason": "",
         }
+
+    timeout = _clamp_tool_timeout(timeout)
 
     result = await asyncio.to_thread(session.type, text, timeout=timeout, quiescence_ms=QUIESCENCE_MS)
     snap = await asyncio.to_thread(session.screen_snapshot, drain=False)
@@ -805,6 +817,8 @@ async def send_password(
     - Forces terminal echo off for this send operation (`echo=False`).
     - Disables transcript logging for this send operation (`log=False`).
     - Returns `output` as the literal string "[password sent]".
+
+    The effective timeout is capped at 300 seconds.
     """
     if session_id in getattr(session_manager, "_terminated", set()):
         return {
@@ -838,6 +852,8 @@ async def send_password(
             "dropped_bytes": 0,
             "state_reason": "",
         }
+
+    timeout = _clamp_tool_timeout(timeout)
 
     result = await asyncio.to_thread(
         session.type,
@@ -901,6 +917,8 @@ async def send_control(
     - `[` or `escape` sends ESC.
 
     Returns the same shape as `run()`.
+
+    The effective timeout is capped at 300 seconds.
     """
     if session_id in getattr(session_manager, "_terminated", set()):
         return {
@@ -943,6 +961,8 @@ async def send_control(
         char = chr(ord(key) - ord("a") + 1)  # Ctrl+letter
     else:
         raise ValueError(f"Unknown control key: {key}")
+
+    timeout = _clamp_tool_timeout(timeout)
 
     result = await asyncio.to_thread(session.type, char, timeout=timeout, quiescence_ms=QUIESCENCE_MS)
     snap = await asyncio.to_thread(session.screen_snapshot, drain=False)
@@ -1023,8 +1043,7 @@ async def poll_output(
             "state_reason": "",
         }
 
-    if timeout > MAX_TOOL_TIMEOUT_S:
-        timeout = MAX_TOOL_TIMEOUT_S
+    timeout = _clamp_tool_timeout(timeout)
 
     result = await asyncio.to_thread(
         session.poll_output,
@@ -1204,6 +1223,8 @@ async def expect(
     """Wait for regex match in terminal output/scrollback.
 
     Requires an existing session created via `create_session(session_id, cwd)`.
+
+    The effective timeout is capped at 300 seconds.
     """
     if session_id in getattr(session_manager, "_terminated", set()):
         return {
@@ -1279,6 +1300,8 @@ async def expect(
             "state_reason": f"matched on rendered text: {reason}",
         }
 
+    timeout = _clamp_tool_timeout(timeout)
+
     result = await asyncio.to_thread(session.expect, pattern, timeout)
     snap = await asyncio.to_thread(session.screen_snapshot, drain=False)
     state, reason = await determine_terminal_state(
@@ -1336,6 +1359,8 @@ async def expect_prompt(
     Notes:
     - This polls output internally; you do not need to call poll_output() in a loop.
     - This does not create a new session_id. Call create_session() first.
+
+    The effective timeout is capped at 300 seconds.
     """
     if session_id not in session_manager.sessions:
         hint = _missing_session_hint(session_id)
@@ -1356,6 +1381,7 @@ async def expect_prompt(
     if state == "READY":
         return {"status": "ready", "prompt": "shell", "matched": True, "timed_out": False, "state_reason": reason}
 
+    timeout = _clamp_tool_timeout(timeout)
     deadline = time.monotonic() + timeout
     while True:
         remaining = deadline - time.monotonic()

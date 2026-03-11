@@ -24,6 +24,9 @@ import pexpect
 import pyte
 
 
+MAX_TIMEOUT_S = 300.0
+
+
 def _safe_id(value: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", value).strip("._-")
     return safe or "default"
@@ -128,6 +131,10 @@ def _session_env(rows: int, cols: int) -> dict[str, str]:
     return env
 
 
+def _clamp_timeout(timeout: float) -> float:
+    return min(timeout, MAX_TIMEOUT_S)
+
+
 class PTY:
     """Quiescence-based PTY wrapper with best-effort VT100 rendering."""
 
@@ -221,6 +228,7 @@ class PTY:
 
             self._fatal_error = None
             self._capture_reset()
+            timeout = _clamp_timeout(timeout)
 
             prev_echo: bool | None = None
             changed_echo = False
@@ -277,6 +285,7 @@ class PTY:
         with self._lock:
             self._fatal_error = None
             self._capture_reset()
+            timeout = _clamp_timeout(timeout)
             status = self._drain(
                 quiescence_ms=self._quiescence_ms if quiescence_ms is None else quiescence_ms,
                 timeout=timeout,
@@ -302,6 +311,7 @@ class PTY:
 
             self._fatal_error = None
             self._capture_reset()
+            timeout = _clamp_timeout(timeout)
 
             pgid = None
             try:
@@ -342,6 +352,7 @@ class PTY:
             except re.error as e:
                 return {"status": "error", "output": "", "match": None, "groups": [], "error": f"re.error: {e}"}
 
+            timeout = _clamp_timeout(timeout)
             deadline = time.monotonic() + timeout
             buf = ""
             match_obj = None
@@ -565,6 +576,7 @@ class PTY:
     ) -> str:
         if quiescence_ms is None:
             quiescence_ms = self._quiescence_ms
+        timeout = _clamp_timeout(timeout)
         deadline = time.monotonic() + timeout
         quiescence_s = quiescence_ms / 1000.0
         saw_output = False

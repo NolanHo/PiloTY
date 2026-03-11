@@ -65,6 +65,39 @@ def test_poll_output_timeout_is_capped(tmp_path):
             pass
 
 
+def test_public_tool_timeouts_are_capped(tmp_path):
+    session_id = "test_public_tool_timeout_cap"
+    try:
+        asyncio.run(mcp_server.create_session(session_id=session_id, cwd=str(tmp_path)))
+        session = mcp_server.session_manager.sessions[session_id]
+
+        captured: list[float] = []
+
+        def patched_type(*args, **kwargs):
+            captured.append(float(kwargs.get("timeout")))
+            return {"status": "timeout", "output": "", "output_truncated": False, "dropped_bytes": 0}
+
+        def patched_expect(pattern, timeout, log=True):
+            captured.append(float(timeout))
+            return {"status": "timeout", "output": "", "output_truncated": False, "dropped_bytes": 0, "match": None, "groups": []}
+
+        session.type = patched_type  # type: ignore[method-assign]
+        session.expect = patched_expect  # type: ignore[method-assign]
+
+        asyncio.run(mcp_server.run(session_id=session_id, command="echo hi", timeout=999999.0))
+        asyncio.run(mcp_server.send_input(session_id=session_id, text="echo hi\n", timeout=999999.0))
+        asyncio.run(mcp_server.send_password(session_id=session_id, password="not_a_secret", timeout=999999.0))
+        asyncio.run(mcp_server.send_control(session_id=session_id, key="c", timeout=999999.0))
+        asyncio.run(mcp_server.expect(session_id=session_id, pattern="hi", timeout=999999.0))
+
+        assert captured == [mcp_server.MAX_TOOL_TIMEOUT_S] * 5
+    finally:
+        try:
+            asyncio.run(mcp_server.terminate(session_id))
+        except Exception:
+            pass
+
+
 def test_mcp_terminate_is_final(tmp_path):
     session_id = "test_mcp_terminate_final"
     try:
