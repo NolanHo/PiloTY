@@ -1,13 +1,14 @@
 """MCP server interface for PiloTY.
 
 Contract (agent-facing):
-- `status` is a single processed state flag: one of `running`, `ready`, `repl`,
-  `password`, `confirm`, `editor`, `pager`, `unknown`, `eof`, `terminated`.
-- `prompt` is best-effort prompt classification: one of `shell`, `python`, `pdb`,
-  `none`, `unknown`.
-- `output` is the PTY stream consumed during this call (typically ANSI-stripped by
-  default via `strip_ansi=true`).
-- Use `get_screen()` / `get_scrollback()` for rendered views.
+- `outcome` is the result of this tool call: `success`, `deadline_exceeded`,
+  `eof`, `error`, `invalid_session`, or `terminated`.
+- `terminal_state` is a best-effort interpretation of the rendered terminal after
+  the tool finishes: `running`, `ready`, `password`, `confirm`, `repl`, `editor`,
+  `pager`, or `unknown`.
+- `output` is the PTY stream consumed during this call only (typically
+  ANSI-stripped by default via `strip_ansi=true`).
+- Use `snapshot_screen()` / `snapshot_scrollback()` for rendered views.
 
 State interpretation uses heuristics by default. If the MCP client advertises
 sampling capability, this server may use sampling to classify terminal state.
@@ -98,28 +99,7 @@ def _maybe_strip_ansi(text: str, *, strip_ansi: bool) -> str:
     return "\n".join(out_lines).rstrip("\n")
 
 
-def _prompt_from_state(state: str, reason: str) -> str:
-    if state == "READY":
-        return "shell"
-    if state == "REPL":
-        r = (reason or "").lower()
-        if "pdb" in r or "ipdb" in r:
-            return "pdb"
-        if "python" in r or "ipython" in r:
-            return "python"
-        return "unknown"
-    if state in {"RUNNING", "PASSWORD", "CONFIRM", "EDITOR", "PAGER"}:
-        return "none"
-    if state == "UNKNOWN":
-        return "unknown"
-    return "unknown"
-
-
-def _status_from_state(*, terminated: bool, alive: bool, state: str) -> str:
-    if terminated:
-        return "terminated"
-    if not alive:
-        return "eof"
+def _terminal_state_from_state(state: str) -> str:
     if state == "READY":
         return "ready"
     if state == "PASSWORD":
@@ -132,11 +112,59 @@ def _status_from_state(*, terminated: bool, alive: bool, state: str) -> str:
         return "editor"
     if state == "PAGER":
         return "pager"
-    if state in {"UNKNOWN", "ERROR"}:
-        return "unknown"
     if state == "RUNNING":
         return "running"
     return "unknown"
+
+
+def _outcome_from_result_status(result_status: str | None) -> str:
+    if result_status in {"quiescent", "matched"}:
+        return "success"
+    if result_status == "timeout":
+        return "deadline_exceeded"
+    if result_status == "eof":
+        return "eof"
+    if result_status == "error":
+        return "error"
+    return "error"
+
+
+async def _describe_terminal(session: PTY, ctx: Context | None) -> tuple[str | None, str]:
+    if not session.alive:
+        return None, "pty eof"
+    snap = await asyncio.to_thread(session.screen_snapshot, drain=False)
+    state, reason = await determine_terminal_state(
+        ctx,
+        snap["screen"],
+        cursor_x=snap.get("cursor_x"),
+        shell_prompt_regex=getattr(session, "shell_prompt_regex", None),
+    )
+    return _terminal_state_from_state(state), reason
+
+
+async def _build_stream_response(
+    *,
+    session: PTY,
+    ctx: Context | None,
+    result: dict,
+    strip_ansi: bool,
+    output: str | None = None,
+    extra: dict | None = None,
+) -> dict:
+    terminal_state, state_reason = await _describe_terminal(session, ctx)
+    resp = {
+        "outcome": _outcome_from_result_status(result.get("status")),
+        "terminal_state": terminal_state,
+        "state_reason": state_reason,
+        "output": _maybe_strip_ansi(result.get("output", "") if output is None else output, strip_ansi=strip_ansi),
+        "output_truncated": bool(result.get("output_truncated", False)),
+        "dropped_bytes": int(result.get("dropped_bytes", 0)),
+    }
+    if extra:
+        resp.update(extra)
+    if result.get("status") in {"error", "eof"}:
+        resp["error"] = str(result.get("error", "pty eof"))
+    return resp
 
 
 def _configure_logging():
@@ -586,7 +614,7 @@ async def create_session(
             observing the actual prompt text if the default heuristics misclassify READY as RUNNING.
     """
     if session_id in getattr(session_manager, "_terminated", set()):
-        return {"status": "terminated", "prompt": "none", "created": False, "state_reason": ""}
+        return {"outcome": "terminated", "terminal_state": None, "created": False, "state_reason": ""}
 
     if not cwd:
         raise ValueError("cwd must be a non-empty path")
@@ -604,7 +632,7 @@ async def create_session(
             )
             session = session_manager.get_session(session_id, cwd=abs_cwd)
         except RuntimeError:
-            return {"status": "terminated", "prompt": "none", "created": False, "state_reason": ""}
+            return {"outcome": "terminated", "terminal_state": None, "created": False, "state_reason": ""}
         created = True
         created_reason = "session created"
     else:
@@ -622,19 +650,11 @@ async def create_session(
         created = False
         created_reason = "session already exists"
 
-    snap = await asyncio.to_thread(session.screen_snapshot, drain=False)
-    state, reason = await determine_terminal_state(
-        ctx,
-        snap["screen"],
-        cursor_x=snap.get("cursor_x"),
-        shell_prompt_regex=getattr(session, "shell_prompt_regex", None),
-    )
-    prompt = _prompt_from_state(state, reason)
-    status = _status_from_state(terminated=False, alive=session.alive, state=state)
+    terminal_state, reason = await _describe_terminal(session, ctx)
     meta = await asyncio.to_thread(session.metadata)
     return {
-        "status": status,
-        "prompt": prompt,
+        "outcome": "success",
+        "terminal_state": terminal_state,
         "created": created,
         "cwd": meta.get("cwd"),
         "description": meta.get("description"),
@@ -644,43 +664,42 @@ async def create_session(
 
 
 @mcp.tool()
-async def run(
+async def send_line(
     session_id: str,
-    command: str,
-    timeout: float = 30.0,
+    line: str,
+    deadline_s: float = 30.0,
+    quiet_ms: int = QUIESCENCE_MS,
     strip_ansi: bool = True,
     ctx: Context | None = None,
 ) -> dict:
-    """Execute a command in a stateful PTY session.
+    """Send one newline-terminated line to a stateful PTY session.
 
     Requires an existing session created via `create_session(session_id, cwd)`.
 
-    Quiescence: reads until the PTY is silent for PILOTY_QUIESCENCE_MS (default 1000ms),
-    or until `timeout` seconds elapse.
+    After sending `line + "\\n"`, this drains newly produced PTY bytes until the
+    PTY is silent for `quiet_ms` milliseconds or until `deadline_s` expires.
 
-    The effective timeout is capped at 300 seconds.
+    `deadline_s` is capped at 300 seconds.
 
     Common SSH pattern:
     - create_session(session_id, cwd)
-    - run(session_id, "ssh host", timeout=...)
-    - expect_prompt(session_id, timeout=...)  # wait for remote shell prompt
+    - send_line(session_id, "ssh host", deadline_s=2)
+    - wait_for_shell_prompt(session_id, deadline_s=30)
     """
     if session_id in getattr(session_manager, "_terminated", set()):
         return {
-            "status": "terminated",
-            "prompt": "none",
+            "outcome": "terminated",
+            "terminal_state": None,
             "output": "",
-            "timed_out": False,
             "output_truncated": False,
             "dropped_bytes": 0,
             "state_reason": "",
         }
     if session_id not in session_manager.sessions:
         return {
-            "status": "unknown",
-            "prompt": "unknown",
+            "outcome": "invalid_session",
+            "terminal_state": None,
             "output": "",
-            "timed_out": False,
             "output_truncated": False,
             "dropped_bytes": 0,
             "state_reason": _missing_session_hint(session_id),
@@ -689,74 +708,51 @@ async def run(
         session = session_manager.get_session(session_id)
     except RuntimeError:
         return {
-            "status": "terminated",
-            "prompt": "none",
+            "outcome": "terminated",
+            "terminal_state": None,
             "output": "",
-            "timed_out": False,
             "output_truncated": False,
             "dropped_bytes": 0,
             "state_reason": "",
         }
 
-    timeout = _clamp_tool_timeout(timeout)
-
-    # Send command with newline
-    result = await asyncio.to_thread(session.type, command + "\n", timeout=timeout, quiescence_ms=QUIESCENCE_MS)
-    snap = await asyncio.to_thread(session.screen_snapshot, drain=False)
-    state, reason = await determine_terminal_state(
-        ctx,
-        snap["screen"],
-        cursor_x=snap.get("cursor_x"),
-        shell_prompt_regex=getattr(session, "shell_prompt_regex", None),
-    )
-
-    prompt = _prompt_from_state(state, reason)
-    status = _status_from_state(terminated=False, alive=session.alive, state=state)
-    output = _maybe_strip_ansi(result.get("output", ""), strip_ansi=strip_ansi)
-    resp = {
-        "status": status,
-        "prompt": prompt,
-        "output": output,
-        "timed_out": result["status"] == "timeout",
-        "output_truncated": bool(result.get("output_truncated", False)),
-        "dropped_bytes": int(result.get("dropped_bytes", 0)),
-        "state_reason": reason,
-    }
-    if result["status"] in {"error", "eof"}:
-        resp["error"] = str(result.get("error", "pty eof"))
-    return resp
+    deadline_s = _clamp_tool_timeout(deadline_s)
+    result = await asyncio.to_thread(session.type, line + "\n", timeout=deadline_s, quiescence_ms=quiet_ms)
+    return await _build_stream_response(session=session, ctx=ctx, result=result, strip_ansi=strip_ansi)
 
 
 @mcp.tool()
-async def send_input(
+async def send_text(
     session_id: str,
     text: str,
-    timeout: float = 30.0,
+    deadline_s: float = 30.0,
+    quiet_ms: int = QUIESCENCE_MS,
     strip_ansi: bool = True,
     ctx: Context | None = None,
 ) -> dict:
-    """Send raw input to a stateful terminal session (no newline added).
+    """Send raw text to a stateful PTY session without adding a newline.
 
     Requires an existing session created via `create_session(session_id, cwd)`.
 
-    The effective timeout is capped at 300 seconds.
+    After sending `text`, this drains newly produced PTY bytes until the PTY is
+    silent for `quiet_ms` milliseconds or until `deadline_s` expires.
+
+    `deadline_s` is capped at 300 seconds.
     """
     if session_id in getattr(session_manager, "_terminated", set()):
         return {
-            "status": "terminated",
-            "prompt": "none",
+            "outcome": "terminated",
+            "terminal_state": None,
             "output": "",
-            "timed_out": False,
             "output_truncated": False,
             "dropped_bytes": 0,
             "state_reason": "",
         }
     if session_id not in session_manager.sessions:
         return {
-            "status": "unknown",
-            "prompt": "unknown",
+            "outcome": "invalid_session",
+            "terminal_state": None,
             "output": "",
-            "timed_out": False,
             "output_truncated": False,
             "dropped_bytes": 0,
             "state_reason": _missing_session_hint(session_id),
@@ -765,48 +761,25 @@ async def send_input(
         session = session_manager.get_session(session_id)
     except RuntimeError:
         return {
-            "status": "terminated",
-            "prompt": "none",
+            "outcome": "terminated",
+            "terminal_state": None,
             "output": "",
-            "timed_out": False,
             "output_truncated": False,
             "dropped_bytes": 0,
             "state_reason": "",
         }
 
-    timeout = _clamp_tool_timeout(timeout)
-
-    result = await asyncio.to_thread(session.type, text, timeout=timeout, quiescence_ms=QUIESCENCE_MS)
-    snap = await asyncio.to_thread(session.screen_snapshot, drain=False)
-    state, reason = await determine_terminal_state(
-        ctx,
-        snap["screen"],
-        cursor_x=snap.get("cursor_x"),
-        shell_prompt_regex=getattr(session, "shell_prompt_regex", None),
-    )
-
-    prompt = _prompt_from_state(state, reason)
-    status = _status_from_state(terminated=False, alive=session.alive, state=state)
-    output = _maybe_strip_ansi(result.get("output", ""), strip_ansi=strip_ansi)
-    resp = {
-        "status": status,
-        "prompt": prompt,
-        "output": output,
-        "timed_out": result["status"] == "timeout",
-        "output_truncated": bool(result.get("output_truncated", False)),
-        "dropped_bytes": int(result.get("dropped_bytes", 0)),
-        "state_reason": reason,
-    }
-    if result["status"] in {"error", "eof"}:
-        resp["error"] = str(result.get("error", "pty eof"))
-    return resp
+    deadline_s = _clamp_tool_timeout(deadline_s)
+    result = await asyncio.to_thread(session.type, text, timeout=deadline_s, quiescence_ms=quiet_ms)
+    return await _build_stream_response(session=session, ctx=ctx, result=result, strip_ansi=strip_ansi)
 
 
 @mcp.tool()
 async def send_password(
     session_id: str,
     password: str,
-    timeout: float = 30.0,
+    deadline_s: float = 30.0,
+    quiet_ms: int = QUIESCENCE_MS,
     ctx: Context | None = None,
 ) -> dict:
     """Send a password plus newline.
@@ -816,26 +789,28 @@ async def send_password(
     Security model:
     - Forces terminal echo off for this send operation (`echo=False`).
     - Disables transcript logging for this send operation (`log=False`).
-    - Returns `output` as the literal string "[password sent]".
+    - Returns the PTY bytes consumed during this call with best-effort password
+      redaction, prefixed by `[password sent]`.
 
-    The effective timeout is capped at 300 seconds.
+    After sending `password + "\\n"`, this drains newly produced PTY bytes until
+    the PTY is silent for `quiet_ms` milliseconds or until `deadline_s` expires.
+
+    `deadline_s` is capped at 300 seconds.
     """
     if session_id in getattr(session_manager, "_terminated", set()):
         return {
-            "status": "terminated",
-            "prompt": "none",
+            "outcome": "terminated",
+            "terminal_state": None,
             "output": "",
-            "timed_out": False,
             "output_truncated": False,
             "dropped_bytes": 0,
             "state_reason": "",
         }
     if session_id not in session_manager.sessions:
         return {
-            "status": "unknown",
-            "prompt": "unknown",
+            "outcome": "invalid_session",
+            "terminal_state": None,
             "output": "",
-            "timed_out": False,
             "output_truncated": False,
             "dropped_bytes": 0,
             "state_reason": _missing_session_hint(session_id),
@@ -844,37 +819,24 @@ async def send_password(
         session = session_manager.get_session(session_id)
     except RuntimeError:
         return {
-            "status": "terminated",
-            "prompt": "none",
+            "outcome": "terminated",
+            "terminal_state": None,
             "output": "",
-            "timed_out": False,
             "output_truncated": False,
             "dropped_bytes": 0,
             "state_reason": "",
         }
 
-    timeout = _clamp_tool_timeout(timeout)
+    deadline_s = _clamp_tool_timeout(deadline_s)
 
     result = await asyncio.to_thread(
         session.type,
         password + "\n",
-        timeout=timeout,
-        quiescence_ms=QUIESCENCE_MS,
+        timeout=deadline_s,
+        quiescence_ms=quiet_ms,
         log=False,
         echo=False,
     )
-
-    snap = await asyncio.to_thread(session.screen_snapshot, log=False, drain=False)
-
-    state, reason = await determine_terminal_state(
-        ctx,
-        snap["screen"],
-        cursor_x=snap.get("cursor_x"),
-        shell_prompt_regex=getattr(session, "shell_prompt_regex", None),
-    )
-
-    prompt = _prompt_from_state(state, reason)
-    status = _status_from_state(terminated=False, alive=session.alive, state=state)
     post = _maybe_strip_ansi(result.get("output", ""), strip_ansi=True)
     # Best-effort redact: some programs may still echo input even when echo is
     # disabled, or may include the password in error messages.
@@ -883,25 +845,15 @@ async def send_password(
         out = "[password sent]\n" + redacted
     else:
         out = "[password sent]"
-    resp = {
-        "status": status,
-        "prompt": prompt,
-        "output": out,
-        "timed_out": result["status"] == "timeout",
-        "output_truncated": bool(result.get("output_truncated", False)),
-        "dropped_bytes": int(result.get("dropped_bytes", 0)),
-        "state_reason": reason,
-    }
-    if result["status"] in {"error", "eof"}:
-        resp["error"] = str(result.get("error", "pty eof"))
-    return resp
+    return await _build_stream_response(session=session, ctx=ctx, result=result, strip_ansi=False, output=out)
 
 
 @mcp.tool()
 async def send_control(
     session_id: str,
     key: str,
-    timeout: float = 5.0,
+    deadline_s: float = 5.0,
+    quiet_ms: int = QUIESCENCE_MS,
     strip_ansi: bool = True,
     ctx: Context | None = None,
 ) -> dict:
@@ -916,26 +868,26 @@ async def send_control(
     - `l` sends Ctrl+L (clear screen in many shells).
     - `[` or `escape` sends ESC.
 
-    Returns the same shape as `run()`.
+    After sending the control character, this drains newly produced PTY bytes
+    until the PTY is silent for `quiet_ms` milliseconds or until `deadline_s`
+    expires.
 
-    The effective timeout is capped at 300 seconds.
+    `deadline_s` is capped at 300 seconds.
     """
     if session_id in getattr(session_manager, "_terminated", set()):
         return {
-            "status": "terminated",
-            "prompt": "none",
+            "outcome": "terminated",
+            "terminal_state": None,
             "output": "",
-            "timed_out": False,
             "output_truncated": False,
             "dropped_bytes": 0,
             "state_reason": "",
         }
     if session_id not in session_manager.sessions:
         return {
-            "status": "unknown",
-            "prompt": "unknown",
+            "outcome": "invalid_session",
+            "terminal_state": None,
             "output": "",
-            "timed_out": False,
             "output_truncated": False,
             "dropped_bytes": 0,
             "state_reason": _missing_session_hint(session_id),
@@ -944,10 +896,9 @@ async def send_control(
         session = session_manager.get_session(session_id)
     except RuntimeError:
         return {
-            "status": "terminated",
-            "prompt": "none",
+            "outcome": "terminated",
+            "terminal_state": None,
             "output": "",
-            "timed_out": False,
             "output_truncated": False,
             "dropped_bytes": 0,
             "state_reason": "",
@@ -962,70 +913,48 @@ async def send_control(
     else:
         raise ValueError(f"Unknown control key: {key}")
 
-    timeout = _clamp_tool_timeout(timeout)
-
-    result = await asyncio.to_thread(session.type, char, timeout=timeout, quiescence_ms=QUIESCENCE_MS)
-    snap = await asyncio.to_thread(session.screen_snapshot, drain=False)
-
-    state, reason = await determine_terminal_state(
-        ctx,
-        snap["screen"],
-        cursor_x=snap.get("cursor_x"),
-        shell_prompt_regex=getattr(session, "shell_prompt_regex", None),
-    )
-
-    prompt = _prompt_from_state(state, reason)
-    status = _status_from_state(terminated=False, alive=session.alive, state=state)
-    output = _maybe_strip_ansi(result.get("output", ""), strip_ansi=strip_ansi)
-    resp = {
-        "status": status,
-        "prompt": prompt,
-        "output": output,
-        "timed_out": result["status"] == "timeout",
-        "output_truncated": bool(result.get("output_truncated", False)),
-        "dropped_bytes": int(result.get("dropped_bytes", 0)),
-        "state_reason": reason,
-    }
-    if result["status"] in {"error", "eof"}:
-        resp["error"] = str(result.get("error", "pty eof"))
-    return resp
+    deadline_s = _clamp_tool_timeout(deadline_s)
+    result = await asyncio.to_thread(session.type, char, timeout=deadline_s, quiescence_ms=quiet_ms)
+    return await _build_stream_response(session=session, ctx=ctx, result=result, strip_ansi=strip_ansi)
 
 
 @mcp.tool()
-async def poll_output(
+async def wait_for_output(
     session_id: str,
-    timeout: float = 0.1,
+    deadline_s: float = 30.0,
+    quiet_ms: int = QUIESCENCE_MS,
     strip_ansi: bool = True,
     ctx: Context | None = None,
 ) -> dict:
-    """Wait for new output without sending input.
+    """Wait for newly arriving PTY output without sending input.
 
     Requires an existing session created via `create_session(session_id, cwd)`.
 
-    Quiescence: returns immediately once any output is observed and the PTY is
-    silent for PILOTY_QUIESCENCE_MS (default 1000ms). Returns empty output only
-    when `timeout` elapses without any output.
+    This waits for new PTY bytes to arrive. After the first new output is
+    observed, it continues draining until the PTY is silent for `quiet_ms`
+    milliseconds or until `deadline_s` expires.
 
-    The effective timeout is capped at 300 seconds.
+    `deadline_s` is capped at 300 seconds. If the deadline expires after some
+    output has already been captured, partial output is returned with
+    `outcome="deadline_exceeded"`.
 
-    If you need to wait for a shell prompt (e.g., after SSH), use expect_prompt().
+    If you need to wait specifically for a shell prompt, use
+    `wait_for_shell_prompt()`.
     """
     if session_id in getattr(session_manager, "_terminated", set()):
         return {
-            "status": "terminated",
-            "prompt": "none",
+            "outcome": "terminated",
+            "terminal_state": None,
             "output": "",
-            "timed_out": False,
             "output_truncated": False,
             "dropped_bytes": 0,
             "state_reason": "",
         }
     if session_id not in session_manager.sessions:
         return {
-            "status": "unknown",
-            "prompt": "unknown",
+            "outcome": "invalid_session",
+            "terminal_state": None,
             "output": "",
-            "timed_out": False,
             "output_truncated": False,
             "dropped_bytes": 0,
             "state_reason": _missing_session_hint(session_id),
@@ -1034,58 +963,31 @@ async def poll_output(
         session = session_manager.get_session(session_id)
     except RuntimeError:
         return {
-            "status": "terminated",
-            "prompt": "none",
+            "outcome": "terminated",
+            "terminal_state": None,
             "output": "",
-            "timed_out": False,
             "output_truncated": False,
             "dropped_bytes": 0,
             "state_reason": "",
         }
 
-    timeout = _clamp_tool_timeout(timeout)
-
-    result = await asyncio.to_thread(
-        session.poll_output,
-        timeout=timeout,
-        quiescence_ms=QUIESCENCE_MS,
-    )
-    snap = await asyncio.to_thread(session.screen_snapshot, drain=False)
-
-    state, reason = await determine_terminal_state(
-        ctx,
-        snap["screen"],
-        cursor_x=snap.get("cursor_x"),
-        shell_prompt_regex=getattr(session, "shell_prompt_regex", None),
-    )
-
-    prompt = _prompt_from_state(state, reason)
-    status = _status_from_state(terminated=False, alive=session.alive, state=state)
-    output = _maybe_strip_ansi(result.get("output", ""), strip_ansi=strip_ansi)
-    resp = {
-        "status": status,
-        "prompt": prompt,
-        "output": output,
-        "timed_out": result["status"] == "timeout",
-        "output_truncated": bool(result.get("output_truncated", False)),
-        "dropped_bytes": int(result.get("dropped_bytes", 0)),
-        "state_reason": reason,
-    }
-    if result["status"] in {"error", "eof"}:
-        resp["error"] = str(result.get("error", "pty eof"))
-    return resp
+    deadline_s = _clamp_tool_timeout(deadline_s)
+    result = await asyncio.to_thread(session.poll_output, timeout=deadline_s, quiescence_ms=quiet_ms)
+    return await _build_stream_response(session=session, ctx=ctx, result=result, strip_ansi=strip_ansi)
 
 
 @mcp.tool()
-async def get_screen(session_id: str, ctx: Context | None = None) -> dict:
+async def snapshot_screen(session_id: str, ctx: Context | None = None) -> dict:
     """Get the current VT100-rendered terminal screen snapshot.
 
     Requires an existing session created via `create_session(session_id, cwd)`.
+
+    This is a passive snapshot. It does not ingest new PTY bytes.
     """
     if session_id in getattr(session_manager, "_terminated", set()):
         return {
-            "status": "terminated",
-            "prompt": "none",
+            "outcome": "terminated",
+            "terminal_state": None,
             "screen": "",
             "cursor_x": None,
             "cursor_y": None,
@@ -1096,8 +998,8 @@ async def get_screen(session_id: str, ctx: Context | None = None) -> dict:
         }
     if session_id not in session_manager.sessions:
         return {
-            "status": "unknown",
-            "prompt": "unknown",
+            "outcome": "invalid_session",
+            "terminal_state": None,
             "screen": "",
             "cursor_x": None,
             "cursor_y": None,
@@ -1108,19 +1010,11 @@ async def get_screen(session_id: str, ctx: Context | None = None) -> dict:
         }
     session = session_manager.sessions[session_id]
 
-    # Do not drain the PTY here. Output ingestion happens via run/send_*/poll_output/expect.
     snap = await asyncio.to_thread(session.screen_snapshot, drain=False)
-    state, reason = await determine_terminal_state(
-        ctx,
-        snap["screen"],
-        cursor_x=snap.get("cursor_x"),
-        shell_prompt_regex=getattr(session, "shell_prompt_regex", None),
-    )
-    prompt = _prompt_from_state(state, reason)
-    status = _status_from_state(terminated=False, alive=session.alive, state=state)
+    terminal_state, reason = await _describe_terminal(session, ctx)
     return {
-        "status": status,
-        "prompt": prompt,
+        "outcome": "success",
+        "terminal_state": terminal_state,
         "screen": snap["screen"],
         "cursor_x": snap.get("cursor_x"),
         "cursor_y": snap.get("cursor_y"),
@@ -1132,7 +1026,7 @@ async def get_screen(session_id: str, ctx: Context | None = None) -> dict:
 
 
 @mcp.tool()
-async def get_scrollback(
+async def snapshot_scrollback(
     session_id: str,
     lines: int = 200,
     strip_ansi: bool = False,
@@ -1142,13 +1036,12 @@ async def get_scrollback(
 
     Requires an existing session created via `create_session(session_id, cwd)`.
 
-    If `strip_ansi` is True, strips ANSI escape sequences and common control
-    characters from the returned scrollback.
+    This is a passive snapshot. It does not ingest new PTY bytes.
     """
     if session_id in getattr(session_manager, "_terminated", set()):
         return {
-            "status": "terminated",
-            "prompt": "none",
+            "outcome": "terminated",
+            "terminal_state": None,
             "scrollback": "",
             "rows": None,
             "cols": None,
@@ -1156,8 +1049,8 @@ async def get_scrollback(
         }
     if session_id not in session_manager.sessions:
         return {
-            "status": "unknown",
-            "prompt": "unknown",
+            "outcome": "invalid_session",
+            "terminal_state": None,
             "scrollback": "",
             "rows": None,
             "cols": None,
@@ -1166,21 +1059,13 @@ async def get_scrollback(
     session = session_manager.sessions[session_id]
 
     snap = await asyncio.to_thread(session.screen_snapshot, drain=False)
-    state, reason = await determine_terminal_state(
-        ctx,
-        snap["screen"],
-        cursor_x=snap.get("cursor_x"),
-        shell_prompt_regex=getattr(session, "shell_prompt_regex", None),
-    )
-    prompt = _prompt_from_state(state, reason)
-    status = _status_from_state(terminated=False, alive=session.alive, state=state)
-    # Do not drain the PTY here. Output ingestion happens via run/send_*/poll_output/expect.
-    sb = await asyncio.to_thread(session.get_scrollback, lines, drain=False)
-    sb = _maybe_strip_ansi(sb, strip_ansi=strip_ansi)
+    terminal_state, reason = await _describe_terminal(session, ctx)
+    scrollback = await asyncio.to_thread(session.get_scrollback, lines, drain=False)
+    scrollback = _maybe_strip_ansi(scrollback, strip_ansi=strip_ansi)
     return {
-        "status": status,
-        "prompt": prompt,
-        "scrollback": sb,
+        "outcome": "success",
+        "terminal_state": terminal_state,
+        "scrollback": scrollback,
         "rows": snap.get("rows"),
         "cols": snap.get("cols"),
         "state_reason": reason,
@@ -1194,60 +1079,59 @@ async def clear_scrollback(session_id: str, ctx: Context | None = None) -> dict:
     Requires an existing session created via `create_session(session_id, cwd)`.
     """
     if session_id in getattr(session_manager, "_terminated", set()):
-        return {"status": "terminated", "prompt": "none", "state_reason": ""}
+        return {"outcome": "terminated", "terminal_state": None, "state_reason": ""}
     if session_id not in session_manager.sessions:
-        return {"status": "unknown", "prompt": "unknown", "state_reason": _missing_session_hint(session_id)}
+        return {"outcome": "invalid_session", "terminal_state": None, "state_reason": _missing_session_hint(session_id)}
     session = session_manager.sessions[session_id]
 
     await asyncio.to_thread(session.clear_scrollback)
-    snap = await asyncio.to_thread(session.screen_snapshot, drain=False)
-    state, reason = await determine_terminal_state(
-        ctx,
-        snap["screen"],
-        cursor_x=snap.get("cursor_x"),
-        shell_prompt_regex=getattr(session, "shell_prompt_regex", None),
-    )
-    prompt = _prompt_from_state(state, reason)
-    status = _status_from_state(terminated=False, alive=session.alive, state=state)
-    return {"status": status, "prompt": prompt, "state_reason": reason}
+    terminal_state, reason = await _describe_terminal(session, ctx)
+    return {"outcome": "success", "terminal_state": terminal_state, "state_reason": reason}
 
 
 @mcp.tool()
-async def expect(
+async def wait_for_regex(
     session_id: str,
     pattern: str,
-    timeout: float = 30.0,
+    deadline_s: float = 30.0,
+    search_scope: str = "visible_or_new",
     strip_ansi: bool = True,
     ctx: Context | None = None,
 ) -> dict:
-    """Wait for regex match in terminal output/scrollback.
+    """Wait for a regex match in rendered text and/or newly arriving PTY bytes.
 
     Requires an existing session created via `create_session(session_id, cwd)`.
 
-    The effective timeout is capped at 300 seconds.
+    `search_scope` controls where matching begins:
+    - `visible_or_new`: check already rendered scrollback first, then wait on new PTY output.
+    - `new_only`: ignore already visible text and wait only on new PTY output.
+
+    `deadline_s` is capped at 300 seconds.
     """
+    if search_scope not in {"visible_or_new", "new_only"}:
+        raise ValueError("search_scope must be one of: visible_or_new, new_only")
     if session_id in getattr(session_manager, "_terminated", set()):
         return {
-            "status": "terminated",
-            "prompt": "none",
+            "outcome": "terminated",
+            "terminal_state": None,
             "output": "",
             "matched": False,
             "match": None,
             "groups": [],
-            "timed_out": False,
+            "match_source": None,
             "output_truncated": False,
             "dropped_bytes": 0,
             "state_reason": "",
         }
     if session_id not in session_manager.sessions:
         return {
-            "status": "unknown",
-            "prompt": "unknown",
+            "outcome": "invalid_session",
+            "terminal_state": None,
             "output": "",
             "matched": False,
             "match": None,
             "groups": [],
-            "timed_out": False,
+            "match_source": None,
             "output_truncated": False,
             "dropped_bytes": 0,
             "state_reason": _missing_session_hint(session_id),
@@ -1256,152 +1140,176 @@ async def expect(
         session = session_manager.get_session(session_id)
     except RuntimeError:
         return {
-            "status": "terminated",
-            "prompt": "none",
+            "outcome": "terminated",
+            "terminal_state": None,
             "output": "",
             "matched": False,
             "match": None,
             "groups": [],
-            "timed_out": False,
+            "match_source": None,
             "output_truncated": False,
             "dropped_bytes": 0,
             "state_reason": "",
         }
 
-    # If the pattern is already visible in the current rendered text, return
-    # immediately. This matches common agent usage ("wait until prompt appears"),
-    # where the prompt may already be present by the time expect() is called.
     try:
         rx = re.compile(pattern)
     except re.error as e:
         raise ValueError(f"re.error: {e}")
-    visible = await asyncio.to_thread(session.get_scrollback, 5000, log=False, drain=False)
-    m0 = rx.search(visible)
-    if m0:
-        snap = await asyncio.to_thread(session.screen_snapshot, drain=False)
-        state, reason = await determine_terminal_state(
-            ctx,
-            snap["screen"],
-            cursor_x=snap.get("cursor_x"),
-            shell_prompt_regex=getattr(session, "shell_prompt_regex", None),
-        )
-        prompt = _prompt_from_state(state, reason)
-        status = _status_from_state(terminated=False, alive=session.alive, state=state)
-        return {
-            "status": status,
-            "prompt": prompt,
-            "output": "",
-            "matched": True,
-            "match": m0.group(0),
-            "groups": list(m0.groups()),
-            "timed_out": False,
-            "output_truncated": False,
-            "dropped_bytes": 0,
-            "state_reason": f"matched on rendered text: {reason}",
-        }
 
-    timeout = _clamp_tool_timeout(timeout)
+    if search_scope == "visible_or_new":
+        visible = await asyncio.to_thread(session.get_scrollback, 5000, log=False, drain=False)
+        visible_match = rx.search(visible)
+        if visible_match:
+            terminal_state, reason = await _describe_terminal(session, ctx)
+            return {
+                "outcome": "success",
+                "terminal_state": terminal_state,
+                "output": "",
+                "matched": True,
+                "match": visible_match.group(0),
+                "groups": list(visible_match.groups()),
+                "match_source": "visible",
+                "output_truncated": False,
+                "dropped_bytes": 0,
+                "state_reason": f"matched on rendered text: {reason}",
+            }
 
-    result = await asyncio.to_thread(session.expect, pattern, timeout)
-    snap = await asyncio.to_thread(session.screen_snapshot, drain=False)
-    state, reason = await determine_terminal_state(
-        ctx,
-        snap["screen"],
-        cursor_x=snap.get("cursor_x"),
-        shell_prompt_regex=getattr(session, "shell_prompt_regex", None),
+    deadline_s = _clamp_tool_timeout(deadline_s)
+    result = await asyncio.to_thread(session.expect, pattern, deadline_s)
+    resp = await _build_stream_response(
+        session=session,
+        ctx=ctx,
+        result=result,
+        strip_ansi=strip_ansi,
+        extra={
+            "matched": result.get("status") == "matched",
+            "match": result.get("match"),
+            "groups": result.get("groups", []),
+            "match_source": "new_output" if result.get("status") == "matched" else None,
+        },
     )
-    prompt = _prompt_from_state(state, reason)
-
-    status = _status_from_state(terminated=False, alive=session.alive, state=state)
-
-    out = _maybe_strip_ansi(result.get("output", ""), strip_ansi=strip_ansi)
-    resp = {
-        "status": status,
-        "prompt": prompt,
-        "output": out,
-        "matched": result.get("status") == "matched",
-        "match": result.get("match"),
-        "groups": result.get("groups", []),
-        "timed_out": result.get("status") == "timeout",
-        "output_truncated": bool(result.get("output_truncated", False)),
-        "dropped_bytes": int(result.get("dropped_bytes", 0)),
-        "state_reason": reason,
-    }
-    if result.get("status") == "error":
-        resp["error"] = str(result.get("error", "pty error"))
     return resp
 
 
 @mcp.tool()
-async def expect_prompt(
+async def wait_for_shell_prompt(
     session_id: str,
-    timeout: float = 30.0,
+    deadline_s: float = 30.0,
+    quiet_ms: int = QUIESCENCE_MS,
+    strip_ansi: bool = True,
     ctx: Context | None = None,
 ) -> dict:
-    """Wait until a shell prompt is detected (READY).
+    """Wait until a shell prompt is detected.
 
     Requires an existing session created via `create_session(session_id, cwd)`.
 
-    Intended for SSH workflows where login banners and prompts may arrive after
-    the initial `run()` returns. This avoids requiring agents to supply a fragile
-    regex like r"[$#] ?$".
+    This repeatedly ingests new PTY output and re-runs prompt detection until a
+    shell prompt is visible or until `deadline_s` expires. Any output consumed
+    during that wait is returned in `output`.
 
-    If the remote shell uses a heavily customized prompt that the default
-    heuristics misclassify, set `shell_prompt_regex` via `configure_session(...)`
-    (or pass it to `create_session(...)`) to make READY detection reliable.
+    If the remote shell uses a customized prompt that the default heuristics
+    misclassify, set `shell_prompt_regex` via `configure_session(...)` or
+    `create_session(...)`.
 
-    Typical usage:
-    - create_session(session_id, cwd)
-    - run(session_id, "ssh host", timeout=2)
-    - expect_prompt(session_id, timeout=30)
-    - run(session_id, "cd /var/log", timeout=5)
-
-    Notes:
-    - This polls output internally; you do not need to call poll_output() in a loop.
-    - This does not create a new session_id. Call create_session() first.
-
-    The effective timeout is capped at 300 seconds.
+    `deadline_s` is capped at 300 seconds.
     """
+    if session_id in getattr(session_manager, "_terminated", set()):
+        return {
+            "outcome": "terminated",
+            "terminal_state": None,
+            "output": "",
+            "prompt_detected": False,
+            "output_truncated": False,
+            "dropped_bytes": 0,
+            "state_reason": "",
+        }
     if session_id not in session_manager.sessions:
-        hint = _missing_session_hint(session_id)
-        tp = _session_transcript_path_if_exists(session_id)
-        if tp:
-            hint = _missing_session_hint(session_id)
-        return {"status": "unknown", "prompt": "unknown", "matched": False, "timed_out": True, "state_reason": hint}
+        return {
+            "outcome": "invalid_session",
+            "terminal_state": None,
+            "output": "",
+            "prompt_detected": False,
+            "output_truncated": False,
+            "dropped_bytes": 0,
+            "state_reason": _missing_session_hint(session_id),
+        }
 
     session = session_manager.sessions[session_id]
+    terminal_state, reason = await _describe_terminal(session, ctx)
+    if terminal_state == "ready":
+        return {
+            "outcome": "success",
+            "terminal_state": terminal_state,
+            "output": "",
+            "prompt_detected": True,
+            "output_truncated": False,
+            "dropped_bytes": 0,
+            "state_reason": reason,
+        }
 
-    snap = await asyncio.to_thread(session.screen_snapshot, drain=False)
-    state, reason = await determine_terminal_state(
-        ctx,
-        snap["screen"],
-        cursor_x=snap.get("cursor_x"),
-        shell_prompt_regex=getattr(session, "shell_prompt_regex", None),
-    )
-    if state == "READY":
-        return {"status": "ready", "prompt": "shell", "matched": True, "timed_out": False, "state_reason": reason}
-
-    timeout = _clamp_tool_timeout(timeout)
-    deadline = time.monotonic() + timeout
+    deadline_s = _clamp_tool_timeout(deadline_s)
+    deadline = time.monotonic() + deadline_s
+    chunks: list[str] = []
+    dropped_bytes = 0
+    output_truncated = False
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return {"status": "running", "prompt": "none", "matched": False, "timed_out": True, "state_reason": reason}
+            terminal_state, reason = await _describe_terminal(session, ctx)
+            return {
+                "outcome": "deadline_exceeded",
+                "terminal_state": terminal_state,
+                "output": _maybe_strip_ansi("".join(chunks), strip_ansi=strip_ansi),
+                "prompt_detected": False,
+                "output_truncated": output_truncated,
+                "dropped_bytes": dropped_bytes,
+                "state_reason": reason,
+            }
 
-        # Ingest any new output. This is what advances the VT100 renderer.
-        await asyncio.to_thread(session.poll_output, timeout=min(0.25, remaining), quiescence_ms=QUIESCENCE_MS)
-
-        snap = await asyncio.to_thread(session.screen_snapshot, drain=False)
-        state, reason = await determine_terminal_state(
-            ctx,
-            snap["screen"],
-            cursor_x=snap.get("cursor_x"),
-            shell_prompt_regex=getattr(session, "shell_prompt_regex", None),
+        poll_result = await asyncio.to_thread(
+            session.poll_output,
+            timeout=min(0.25, remaining),
+            quiescence_ms=quiet_ms,
         )
-        if state == "READY":
-            return {"status": "ready", "prompt": "shell", "matched": True, "timed_out": False, "state_reason": reason}
-        if not session.alive:
-            return {"status": "eof", "prompt": "none", "matched": False, "timed_out": False, "state_reason": "pty eof"}
+        chunk = poll_result.get("output", "")
+        if chunk:
+            chunks.append(chunk)
+        output_truncated = output_truncated or bool(poll_result.get("output_truncated", False))
+        dropped_bytes += int(poll_result.get("dropped_bytes", 0))
+
+        terminal_state, reason = await _describe_terminal(session, ctx)
+        if terminal_state == "ready":
+            return {
+                "outcome": "success",
+                "terminal_state": terminal_state,
+                "output": _maybe_strip_ansi("".join(chunks), strip_ansi=strip_ansi),
+                "prompt_detected": True,
+                "output_truncated": output_truncated,
+                "dropped_bytes": dropped_bytes,
+                "state_reason": reason,
+            }
+        if poll_result.get("status") == "eof" or not session.alive:
+            return {
+                "outcome": "eof",
+                "terminal_state": None,
+                "output": _maybe_strip_ansi("".join(chunks), strip_ansi=strip_ansi),
+                "prompt_detected": False,
+                "output_truncated": output_truncated,
+                "dropped_bytes": dropped_bytes,
+                "state_reason": "pty eof",
+            }
+        if poll_result.get("status") == "error":
+            return {
+                "outcome": "error",
+                "terminal_state": terminal_state,
+                "output": _maybe_strip_ansi("".join(chunks), strip_ansi=strip_ansi),
+                "prompt_detected": False,
+                "output_truncated": output_truncated,
+                "dropped_bytes": dropped_bytes,
+                "state_reason": reason,
+                "error": str(poll_result.get("error", "pty error")),
+            }
 
 
 @mcp.tool()
@@ -1412,8 +1320,8 @@ async def get_metadata(session_id: str, ctx: Context | None = None) -> dict:
     """
     if session_id in getattr(session_manager, "_terminated", set()):
         return {
-            "status": "terminated",
-            "prompt": "none",
+            "outcome": "terminated",
+            "terminal_state": None,
             "cwd": None,
             "pid": None,
             "cols": None,
@@ -1426,8 +1334,8 @@ async def get_metadata(session_id: str, ctx: Context | None = None) -> dict:
         }
     if session_id not in session_manager.sessions:
         return {
-            "status": "unknown",
-            "prompt": "unknown",
+            "outcome": "invalid_session",
+            "terminal_state": None,
             "cwd": None,
             "pid": None,
             "cols": None,
@@ -1440,15 +1348,7 @@ async def get_metadata(session_id: str, ctx: Context | None = None) -> dict:
         }
     session = session_manager.sessions[session_id]
 
-    snap = await asyncio.to_thread(session.screen_snapshot, drain=False)
-    state, reason = await determine_terminal_state(
-        ctx,
-        snap["screen"],
-        cursor_x=snap.get("cursor_x"),
-        shell_prompt_regex=getattr(session, "shell_prompt_regex", None),
-    )
-    prompt = _prompt_from_state(state, reason)
-    status = _status_from_state(terminated=False, alive=session.alive, state=state)
+    terminal_state, reason = await _describe_terminal(session, ctx)
     meta = await asyncio.to_thread(session.metadata)
     out = {
         k: meta.get(k)
@@ -1464,7 +1364,7 @@ async def get_metadata(session_id: str, ctx: Context | None = None) -> dict:
         ]
     }
     out.update({"state_reason": reason})
-    return {"status": status, "prompt": prompt, **out}
+    return {"outcome": "success", "terminal_state": terminal_state, **out}
 
 
 @mcp.tool()
@@ -1504,7 +1404,7 @@ async def configure_session(
     and applied when the session is created.
     """
     if session_id in getattr(session_manager, "_terminated", set()):
-        return {"status": "terminated", "prompt": "none", "state_reason": ""}
+        return {"outcome": "terminated", "terminal_state": None, "state_reason": ""}
 
     try:
         session_manager.configure_full(
@@ -1514,33 +1414,25 @@ async def configure_session(
         )
     except RuntimeError as e:
         if str(e) == "terminated":
-            return {"status": "terminated", "prompt": "none", "state_reason": ""}
+            return {"outcome": "terminated", "terminal_state": None, "state_reason": ""}
         raise ValueError(str(e))
 
     session = session_manager.sessions.get(session_id)
     if session is None:
         cfg = session_manager._config.get(session_id, {})
         return {
-            "status": "running",
-            "prompt": "unknown",
+            "outcome": "success",
+            "terminal_state": None,
             "session_exists": False,
             "description": cfg.get("description"),
             "shell_prompt_regex": cfg.get("shell_prompt_regex"),
             "state_reason": "configured (session not yet created; call create_session(session_id, cwd))",
         }
 
-    snap = await asyncio.to_thread(session.screen_snapshot, drain=False)
-    state, reason = await determine_terminal_state(
-        ctx,
-        snap["screen"],
-        cursor_x=snap.get("cursor_x"),
-        shell_prompt_regex=getattr(session, "shell_prompt_regex", None),
-    )
-    prompt = _prompt_from_state(state, reason)
-    status = _status_from_state(terminated=False, alive=session.alive, state=state)
+    terminal_state, reason = await _describe_terminal(session, ctx)
     return {
-        "status": status,
-        "prompt": prompt,
+        "outcome": "success",
+        "terminal_state": terminal_state,
         "session_exists": True,
         "description": getattr(session, "description", None),
         "shell_prompt_regex": getattr(session, "shell_prompt_regex", None),
@@ -1552,6 +1444,8 @@ async def configure_session(
 async def send_signal(
     session_id: str,
     signal: str,
+    deadline_s: float = 5.0,
+    quiet_ms: int = QUIESCENCE_MS,
     strip_ansi: bool = True,
     ctx: Context | None = None,
 ) -> dict:
@@ -1561,20 +1455,18 @@ async def send_signal(
     """
     if session_id in getattr(session_manager, "_terminated", set()):
         return {
-            "status": "terminated",
-            "prompt": "none",
+            "outcome": "terminated",
+            "terminal_state": None,
             "output": "",
-            "timed_out": False,
             "output_truncated": False,
             "dropped_bytes": 0,
             "state_reason": "",
         }
     if session_id not in session_manager.sessions:
         return {
-            "status": "unknown",
-            "prompt": "unknown",
+            "outcome": "invalid_session",
+            "terminal_state": None,
             "output": "",
-            "timed_out": False,
             "output_truncated": False,
             "dropped_bytes": 0,
             "state_reason": _missing_session_hint(session_id),
@@ -1583,10 +1475,9 @@ async def send_signal(
         session = session_manager.get_session(session_id)
     except RuntimeError:
         return {
-            "status": "terminated",
-            "prompt": "none",
+            "outcome": "terminated",
+            "terminal_state": None,
             "output": "",
-            "timed_out": False,
             "output_truncated": False,
             "dropped_bytes": 0,
             "state_reason": "",
@@ -1605,42 +1496,22 @@ async def send_signal(
             raise ValueError(f"Unknown signal: {signal!r}")
         signum = int(signum)
 
-    result = await asyncio.to_thread(session.send_signal, signum)
-    snap = await asyncio.to_thread(session.screen_snapshot, drain=False)
-    state, reason = await determine_terminal_state(
-        ctx,
-        snap["screen"],
-        cursor_x=snap.get("cursor_x"),
-        shell_prompt_regex=getattr(session, "shell_prompt_regex", None),
-    )
-    prompt = _prompt_from_state(state, reason)
-    status = _status_from_state(terminated=False, alive=session.alive, state=state)
-    output = _maybe_strip_ansi(result.get("output", ""), strip_ansi=strip_ansi)
-    resp = {
-        "status": status,
-        "prompt": prompt,
-        "output": output,
-        "timed_out": result.get("status") == "timeout",
-        "output_truncated": bool(result.get("output_truncated", False)),
-        "dropped_bytes": int(result.get("dropped_bytes", 0)),
-        "state_reason": reason,
-    }
-    if result.get("status") in {"error", "eof"}:
-        resp["error"] = str(result.get("error", "pty error"))
-    return resp
+    deadline_s = _clamp_tool_timeout(deadline_s)
+    result = await asyncio.to_thread(session.send_signal, signum, deadline_s, True, quiet_ms)
+    return await _build_stream_response(session=session, ctx=ctx, result=result, strip_ansi=strip_ansi)
 
 
 @mcp.tool()
 def transcript(session_id: str) -> dict:
     """Get the transcript file path for this session."""
     if session_id in getattr(session_manager, "_terminated", set()):
-        return {"status": "terminated", "prompt": "none", "transcript": None, "state_reason": ""}
+        return {"outcome": "terminated", "terminal_state": None, "transcript": None, "state_reason": ""}
     if session_id not in session_manager.sessions:
         hint = _missing_session_hint(session_id)
         tp = _session_transcript_path_if_exists(session_id)
         if tp:
-            return {"status": "unknown", "prompt": "unknown", "transcript": tp, "state_reason": hint}
-        return {"status": "unknown", "prompt": "unknown", "transcript": None, "state_reason": hint}
+            return {"outcome": "invalid_session", "terminal_state": None, "transcript": tp, "state_reason": hint}
+        return {"outcome": "invalid_session", "terminal_state": None, "transcript": None, "state_reason": hint}
     session = session_manager.sessions[session_id]
 
     snap = session.screen_snapshot(log=False, drain=False)
@@ -1649,9 +1520,12 @@ def transcript(session_id: str) -> dict:
         cursor_x=snap.get("cursor_x"),
         shell_prompt_regex=getattr(session, "shell_prompt_regex", None),
     )
-    prompt = _prompt_from_state(state, reason)
-    status = _status_from_state(terminated=False, alive=session.alive, state=state)
-    return {"status": status, "prompt": prompt, "transcript": session.transcript(), "state_reason": reason}
+    return {
+        "outcome": "success",
+        "terminal_state": _terminal_state_from_state(state) if session.alive else None,
+        "transcript": session.transcript(),
+        "state_reason": reason if session.alive else "pty eof",
+    }
 
 
 @mcp.tool()
@@ -1662,7 +1536,7 @@ async def terminate(session_id: str) -> dict:
         await asyncio.to_thread(session_manager.sessions[session_id].terminate)
         del session_manager.sessions[session_id]
         session_manager._last_used.pop(session_id, None)
-    return {"status": "terminated", "prompt": "none", "state_reason": ""}
+    return {"outcome": "terminated", "terminal_state": None, "state_reason": ""}
 
 
 def signal_handler(sig, frame):

@@ -3,7 +3,7 @@ import asyncio
 from piloty import mcp_server
 
 
-def test_mcp_tool_shapes_include_status_and_prompt(tmp_path):
+def test_mcp_tool_shapes_include_outcome_and_terminal_state(tmp_path):
     prev = mcp_server.QUIESCENCE_MS
     mcp_server.QUIESCENCE_MS = 50
     session_id = "test_mcp_shapes"
@@ -11,29 +11,29 @@ def test_mcp_tool_shapes_include_status_and_prompt(tmp_path):
         created = asyncio.run(mcp_server.create_session(session_id=session_id, cwd=str(tmp_path)))
         assert created["created"] is True
 
-        r = asyncio.run(mcp_server.run(session_id=session_id, command="echo hi", timeout=2.0))
+        r = asyncio.run(mcp_server.send_line(session_id=session_id, line="echo hi", deadline_s=2.0))
         assert "screen" not in r
-        assert set(r.keys()) >= {"status", "prompt", "output", "timed_out"}
+        assert set(r.keys()) >= {"outcome", "terminal_state", "output"}
 
-        r = asyncio.run(mcp_server.send_input(session_id=session_id, text="echo si\n", timeout=2.0))
+        r = asyncio.run(mcp_server.send_text(session_id=session_id, text="echo si\n", deadline_s=2.0))
         assert "screen" not in r
-        assert set(r.keys()) >= {"status", "prompt", "output", "timed_out"}
+        assert set(r.keys()) >= {"outcome", "terminal_state", "output"}
 
-        r = asyncio.run(mcp_server.send_control(session_id=session_id, key="l", timeout=2.0))
+        r = asyncio.run(mcp_server.send_control(session_id=session_id, key="l", deadline_s=2.0))
         assert "screen" not in r
-        assert set(r.keys()) >= {"status", "prompt", "output", "timed_out"}
+        assert set(r.keys()) >= {"outcome", "terminal_state", "output"}
 
-        r = asyncio.run(mcp_server.poll_output(session_id=session_id, timeout=0.05))
-        assert set(r.keys()) >= {"status", "prompt", "output", "timed_out"}
+        r = asyncio.run(mcp_server.wait_for_output(session_id=session_id, deadline_s=0.05))
+        assert set(r.keys()) >= {"outcome", "terminal_state", "output"}
 
-        r = asyncio.run(mcp_server.send_password(session_id=session_id, password="not_a_secret", timeout=2.0))
+        r = asyncio.run(mcp_server.send_password(session_id=session_id, password="not_a_secret", deadline_s=2.0))
         assert "screen" not in r
-        assert set(r.keys()) >= {"status", "prompt", "output", "timed_out"}
+        assert set(r.keys()) >= {"outcome", "terminal_state", "output"}
         assert r["output"].startswith("[password sent]")
         assert "not_a_secret" not in r["output"]
 
-        s = asyncio.run(mcp_server.get_screen(session_id=session_id))
-        assert set(s.keys()) >= {"status", "prompt", "screen"}
+        s = asyncio.run(mcp_server.snapshot_screen(session_id=session_id))
+        assert set(s.keys()) >= {"outcome", "terminal_state", "screen"}
     finally:
         try:
             asyncio.run(mcp_server.terminate(session_id))
@@ -42,8 +42,8 @@ def test_mcp_tool_shapes_include_status_and_prompt(tmp_path):
         mcp_server.QUIESCENCE_MS = prev
 
 
-def test_poll_output_timeout_is_capped(tmp_path):
-    session_id = "test_poll_output_timeout_cap"
+def test_wait_for_output_deadline_is_capped(tmp_path):
+    session_id = "test_wait_for_output_deadline_cap"
     try:
         asyncio.run(mcp_server.create_session(session_id=session_id, cwd=str(tmp_path)))
         session = mcp_server.session_manager.sessions[session_id]
@@ -56,7 +56,7 @@ def test_poll_output_timeout_is_capped(tmp_path):
 
         session.poll_output = patched_poll_output  # type: ignore[method-assign]
 
-        asyncio.run(mcp_server.poll_output(session_id=session_id, timeout=999999.0))
+        asyncio.run(mcp_server.wait_for_output(session_id=session_id, deadline_s=999999.0))
         assert captured["timeout"] == mcp_server.MAX_TOOL_TIMEOUT_S
     finally:
         try:
@@ -84,11 +84,11 @@ def test_public_tool_timeouts_are_capped(tmp_path):
         session.type = patched_type  # type: ignore[method-assign]
         session.expect = patched_expect  # type: ignore[method-assign]
 
-        asyncio.run(mcp_server.run(session_id=session_id, command="echo hi", timeout=999999.0))
-        asyncio.run(mcp_server.send_input(session_id=session_id, text="echo hi\n", timeout=999999.0))
-        asyncio.run(mcp_server.send_password(session_id=session_id, password="not_a_secret", timeout=999999.0))
-        asyncio.run(mcp_server.send_control(session_id=session_id, key="c", timeout=999999.0))
-        asyncio.run(mcp_server.expect(session_id=session_id, pattern="hi", timeout=999999.0))
+        asyncio.run(mcp_server.send_line(session_id=session_id, line="echo hi", deadline_s=999999.0))
+        asyncio.run(mcp_server.send_text(session_id=session_id, text="echo hi\n", deadline_s=999999.0))
+        asyncio.run(mcp_server.send_password(session_id=session_id, password="not_a_secret", deadline_s=999999.0))
+        asyncio.run(mcp_server.send_control(session_id=session_id, key="c", deadline_s=999999.0))
+        asyncio.run(mcp_server.wait_for_regex(session_id=session_id, pattern="hi", deadline_s=999999.0))
 
         assert captured == [mcp_server.MAX_TOOL_TIMEOUT_S] * 5
     finally:
@@ -102,10 +102,10 @@ def test_mcp_terminate_is_final(tmp_path):
     session_id = "test_mcp_terminate_final"
     try:
         asyncio.run(mcp_server.create_session(session_id=session_id, cwd=str(tmp_path)))
-        asyncio.run(mcp_server.run(session_id=session_id, command="echo hi", timeout=2.0))
+        asyncio.run(mcp_server.send_line(session_id=session_id, line="echo hi", deadline_s=2.0))
         asyncio.run(mcp_server.terminate(session_id))
-        r = asyncio.run(mcp_server.run(session_id=session_id, command="echo nope", timeout=2.0))
-        assert r["status"] == "terminated"
+        r = asyncio.run(mcp_server.send_line(session_id=session_id, line="echo nope", deadline_s=2.0))
+        assert r["outcome"] == "terminated"
     finally:
         try:
             asyncio.run(mcp_server.terminate(session_id))

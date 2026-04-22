@@ -8,8 +8,8 @@ from piloty.core import PTY
 
 
 def test_fastmcp_context_injection_detects_ctx_param():
-    assert find_context_parameter(mcp_server.run) == "ctx"
-    assert find_context_parameter(mcp_server.poll_output) == "ctx"
+    assert find_context_parameter(mcp_server.send_line) == "ctx"
+    assert find_context_parameter(mcp_server.wait_for_output) == "ctx"
 
 
 def test_basic_pty_command():

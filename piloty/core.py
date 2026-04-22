@@ -304,7 +304,13 @@ class PTY:
                 self._last_activity_at = self._now_iso()
             return resp
 
-    def send_signal(self, sig: int, timeout: float = 0.2, log: bool = True) -> dict:
+    def send_signal(
+        self,
+        sig: int,
+        timeout: float = 0.2,
+        log: bool = True,
+        quiescence_ms: int | None = None,
+    ) -> dict:
         with self._lock:
             if not self.alive:
                 return {"status": "eof", "output": "", "error": "pty not alive", "output_truncated": False, "dropped_bytes": 0}
@@ -331,7 +337,12 @@ class PTY:
                 return resp
 
             self._last_activity_at = self._now_iso()
-            status = self._drain(quiescence_ms=self._quiescence_ms, timeout=timeout, log=log, capture=True)
+            status = self._drain(
+                quiescence_ms=self._quiescence_ms if quiescence_ms is None else quiescence_ms,
+                timeout=timeout,
+                log=log,
+                capture=True,
+            )
             output = self._capture_output()
             self._last_output_preview = output
             resp = {"status": status, "output": output}

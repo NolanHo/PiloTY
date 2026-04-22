@@ -77,9 +77,9 @@ def test_heuristic_prefers_pdb_prompt_over_traceback_text():
 
 
 def test_error_state_does_not_produce_error_status():
-    # "ERROR" is a heuristic label for screen contents. Transport status remains
-    # in the processed status enum and is not derived from terminal text.
-    assert mcp_server._status_from_state(terminated=False, alive=True, state="ERROR") == "unknown"
+    # "ERROR" is a heuristic label for screen contents and maps to the fallback
+    # terminal state label rather than a transport outcome.
+    assert mcp_server._terminal_state_from_state("ERROR") == "unknown"
 
 
 def test_sampling_ready_does_not_override_running_command_line():
@@ -104,11 +104,12 @@ def test_expect_matches_already_visible_screen():
     session_id = "test_expect_visible"
     try:
         asyncio.run(mcp_server.create_session(session_id=session_id, cwd=os.getcwd()))
-        asyncio.run(mcp_server.run(session_id=session_id, command="echo EXPECTME", timeout=2.0))
-        r = asyncio.run(mcp_server.expect(session_id=session_id, pattern="EXPECTME", timeout=0.1))
+        asyncio.run(mcp_server.send_line(session_id=session_id, line="echo EXPECTME", deadline_s=2.0))
+        r = asyncio.run(mcp_server.wait_for_regex(session_id=session_id, pattern="EXPECTME", deadline_s=0.1))
         assert r["matched"] is True
-        assert r["timed_out"] is False
+        assert r["outcome"] == "success"
         assert r["match"] == "EXPECTME"
+        assert r["match_source"] == "visible"
     finally:
         try:
             asyncio.run(mcp_server.terminate(session_id))
@@ -116,7 +117,7 @@ def test_expect_matches_already_visible_screen():
             pass
 
 
-def test_expect_prompt_waits_for_prompt_after_timeout_run():
+def test_wait_for_shell_prompt_waits_for_prompt_after_partial_send():
     import asyncio
 
     from piloty import mcp_server
@@ -125,19 +126,19 @@ def test_expect_prompt_waits_for_prompt_after_timeout_run():
     try:
         asyncio.run(mcp_server.create_session(session_id=session_id, cwd=os.getcwd()))
         r = asyncio.run(
-            mcp_server.run(
+            mcp_server.send_line(
                 session_id=session_id,
-                command="sh -c 'sleep 0.4'",
-                timeout=0.05,
+                line="sh -c 'sleep 0.4'",
+                deadline_s=0.05,
             )
         )
-        assert r["status"] in {"running", "unknown"}
+        assert r["outcome"] == "deadline_exceeded"
+        assert r["terminal_state"] in {"running", "unknown"}
 
-        r2 = asyncio.run(mcp_server.expect_prompt(session_id=session_id, timeout=2.0))
-        assert r2["matched"] is True
-        assert r2["timed_out"] is False
-        assert r2["status"] == "ready"
-        assert r2["prompt"] == "shell"
+        r2 = asyncio.run(mcp_server.wait_for_shell_prompt(session_id=session_id, deadline_s=2.0))
+        assert r2["prompt_detected"] is True
+        assert r2["outcome"] == "success"
+        assert r2["terminal_state"] == "ready"
     finally:
         try:
             asyncio.run(mcp_server.terminate(session_id))
@@ -145,7 +146,7 @@ def test_expect_prompt_waits_for_prompt_after_timeout_run():
             pass
 
 
-def test_expect_prompt_timeout_is_capped(tmp_path, monkeypatch):
+def test_wait_for_shell_prompt_deadline_is_capped(tmp_path, monkeypatch):
     import asyncio
 
     from piloty import mcp_server
@@ -160,14 +161,14 @@ def test_expect_prompt_timeout_is_capped(tmp_path, monkeypatch):
         def patched_poll_output(*args, **kwargs):
             nonlocal poll_count
             poll_count += 1
-            raise AssertionError("expect_prompt should not poll when clamped timeout is zero")
+            raise AssertionError("wait_for_shell_prompt should not poll when clamped deadline is zero")
 
         session.poll_output = patched_poll_output  # type: ignore[method-assign]
         session.screen_snapshot = lambda drain=False: {"screen": "still running", "cursor_x": 0}  # type: ignore[method-assign]
         monkeypatch.setattr(mcp_server, "_clamp_tool_timeout", lambda timeout: 0.0)
 
-        r = asyncio.run(mcp_server.expect_prompt(session_id=session_id, timeout=999999.0))
-        assert r["timed_out"] is True
+        r = asyncio.run(mcp_server.wait_for_shell_prompt(session_id=session_id, deadline_s=999999.0))
+        assert r["outcome"] == "deadline_exceeded"
         assert poll_count == 0
     finally:
         try:

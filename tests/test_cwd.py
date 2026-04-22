@@ -30,12 +30,12 @@ def test_server_requires_explicit_session_cwd(tmp_path):
             async with ClientSession(read_stream, write_stream) as session:
                 await session.initialize()
                 missing = await session.call_tool(
-                    "run",
-                    {"session_id": "roots-cwd", "command": "pwd", "timeout": 5.0},
+                    "send_line",
+                    {"session_id": "roots-cwd", "line": "pwd", "deadline_s": 5.0},
                 )
                 missing_txt = next(c.text for c in missing.content if getattr(c, "type", None) == "text")
                 missing_payload = json.loads(missing_txt)
-                assert missing_payload["status"] == "unknown"
+                assert missing_payload["outcome"] == "invalid_session"
                 assert "create_session" in missing_payload["state_reason"]
 
                 created = await session.call_tool(
@@ -48,8 +48,8 @@ def test_server_requires_explicit_session_cwd(tmp_path):
                 assert created_payload["cwd"] == str(tmp_path)
 
                 res = await session.call_tool(
-                    "run",
-                    {"session_id": "roots-cwd", "command": "pwd", "timeout": 5.0},
+                    "send_line",
+                    {"session_id": "roots-cwd", "line": "pwd", "deadline_s": 5.0},
                 )
                 txt = next(c.text for c in res.content if getattr(c, "type", None) == "text")
                 assert str(tmp_path) in txt

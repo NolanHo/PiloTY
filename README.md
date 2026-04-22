@@ -61,6 +61,11 @@ PiloTY keeps two representations:
 - `output`: incremental text stream (optionally ANSI-stripped)
 - Rendered screen/scrollback: what a human would see in a terminal
 
+Public MCP results separate call outcome from terminal interpretation:
+
+- `outcome`: `success`, `deadline_exceeded`, `eof`, `error`, `invalid_session`, or `terminated`
+- `terminal_state`: best-effort rendered-state classification after the call (`running`, `ready`, `password`, `confirm`, `repl`, `editor`, `pager`, `unknown`)
+
 Sessions are addressed by a `session_id` string. Reusing the same id is what keeps state.
 
 ## Integration notes (for MCP integrators)
@@ -70,17 +75,22 @@ MCP does not expose a standard "client cwd" field, so the first step is always t
 Typical agent workflow:
 
 - Create a session (explicit cwd) and reuse the same `session_id`.
-- Run commands, poll for output, and send raw input/control keys for interactive programs.
-- For cursor-heavy TUIs, rely on rendered screen snapshots/scrollback rather than plain text output.
-- Use `expect_prompt` after `ssh` or other login flows where the prompt appears later.
-- If prompt detection is wrong (looks idle at a prompt but status stays "running"), configure a custom shell-prompt regex.
+- Use `send_line` to submit a newline-terminated command, `send_text` for raw bytes, and `send_control` / `send_signal` for interrupts.
+- Use `wait_for_output` for temporal PTY output waiting, `wait_for_regex` for content-based waits, and `wait_for_shell_prompt` after `ssh` or similar login flows.
+- Use `snapshot_screen` / `snapshot_scrollback` when layout matters. Snapshot tools are passive and do not ingest fresh PTY bytes.
+- If prompt detection is wrong, configure a custom shell-prompt regex.
 - Use `send_password` for secret entry; terminate the session when done.
 
 For exact tool names, arguments, and return fields, use your MCP client's tool schema or read `piloty/mcp_server.py`.
 
 ## Limitations
 
-- Status/prompt detection is best-effort and can be wrong (especially for custom prompts and cursor-heavy TUIs).
+- `deadline_s` is a wall-clock budget. On send/wait tools, it is not "process completion time".
+- Drain-based tools (`send_line`, `send_text`, `send_control`, `send_password`, `send_signal`, `wait_for_output`) stop after `quiet_ms` of PTY silence or when `deadline_s` expires.
+- `wait_for_output` can return partial output with `outcome=deadline_exceeded` if output started but the PTY never went quiet before the deadline.
+- `wait_for_regex(search_scope="visible_or_new")` first checks already-rendered scrollback, then waits on new PTY bytes. Use `search_scope="new_only"` to ignore already-visible text.
+- `wait_for_shell_prompt` consumes PTY output while it waits and returns the consumed bytes in `output`.
+- Terminal-state detection is best-effort and can be wrong (especially for custom prompts and cursor-heavy TUIs).
 - Plain text output can be misleading for full-screen programs; use screen snapshots when layout matters.
 - `send_password()` suppresses transcript logging and terminal echo for that send. It does not prevent other prompts/programs from echoing secrets later.
 - Quiescence-based output collection can be confused by programs that print periodic noise. Tune with `PILOTY_QUIESCENCE_MS` (default `1000`).
