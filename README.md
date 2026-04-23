@@ -86,9 +86,9 @@ For exact tool names, arguments, and return fields, use your MCP client's tool s
 ## Limitations
 
 - `deadline_s` is a wall-clock budget. On send/wait tools, it is not "process completion time".
-- Drain-based tools (`send_line`, `send_text`, `send_control`, `send_password`, `send_signal`, `wait_for_output`) stop after `quiet_ms` of PTY silence or when `deadline_s` expires.
+- Drain-based tools (`send_line`, `send_text`, `send_control`, `send_password`, `send_signal`, `wait_for_output`) stop after the server quiescence policy (`PILOTY_QUIESCENCE_MS`, default `1000`) or when `deadline_s` expires.
 - `wait_for_output` can return partial output with `outcome=deadline_exceeded` if output started but the PTY never went quiet before the deadline.
-- `wait_for_regex(search_scope="visible_or_new")` first checks already-rendered scrollback, then waits on new PTY bytes. Use `search_scope="new_only"` to ignore already-visible text.
+- `wait_for_regex` first checks already-rendered scrollback, then waits on new PTY bytes.
 - `wait_for_shell_prompt` consumes PTY output while it waits and returns the consumed bytes in `output`.
 - Terminal-state detection is best-effort and can be wrong (especially for custom prompts and cursor-heavy TUIs).
 - Plain text output can be misleading for full-screen programs; use screen snapshots when layout matters.

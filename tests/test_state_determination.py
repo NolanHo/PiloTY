@@ -2,6 +2,8 @@ import asyncio
 import os
 from types import SimpleNamespace
 
+import pytest
+
 from piloty import mcp_server
 
 
@@ -146,7 +148,7 @@ def test_wait_for_shell_prompt_waits_for_prompt_after_partial_send():
             pass
 
 
-def test_wait_for_shell_prompt_deadline_is_capped(tmp_path, monkeypatch):
+def test_wait_for_shell_prompt_rejects_deadline_above_cap(tmp_path):
     import asyncio
 
     from piloty import mcp_server
@@ -154,22 +156,8 @@ def test_wait_for_shell_prompt_deadline_is_capped(tmp_path, monkeypatch):
     session_id = "test_expect_prompt_timeout_cap"
     try:
         asyncio.run(mcp_server.create_session(session_id=session_id, cwd=str(tmp_path)))
-        session = mcp_server.session_manager.sessions[session_id]
-
-        poll_count = 0
-
-        def patched_poll_output(*args, **kwargs):
-            nonlocal poll_count
-            poll_count += 1
-            raise AssertionError("wait_for_shell_prompt should not poll when clamped deadline is zero")
-
-        session.poll_output = patched_poll_output  # type: ignore[method-assign]
-        session.screen_snapshot = lambda drain=False: {"screen": "still running", "cursor_x": 0}  # type: ignore[method-assign]
-        monkeypatch.setattr(mcp_server, "_clamp_tool_timeout", lambda timeout: 0.0)
-
-        r = asyncio.run(mcp_server.wait_for_shell_prompt(session_id=session_id, deadline_s=999999.0))
-        assert r["outcome"] == "deadline_exceeded"
-        assert poll_count == 0
+        with pytest.raises(ValueError, match=r"deadline_s exceeds max 300s"):
+            asyncio.run(mcp_server.wait_for_shell_prompt(session_id=session_id, deadline_s=999999.0))
     finally:
         try:
             asyncio.run(mcp_server.terminate(session_id))

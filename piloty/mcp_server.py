@@ -6,8 +6,8 @@ Contract (agent-facing):
 - `terminal_state` is a best-effort interpretation of the rendered terminal after
   the tool finishes: `running`, `ready`, `password`, `confirm`, `repl`, `editor`,
   `pager`, or `unknown`.
-- `output` is the PTY stream consumed during this call only (typically
-  ANSI-stripped by default via `strip_ansi=true`).
+- `output` is the PTY stream consumed during this call only, normalized into a
+  canonical text form.
 - Use `snapshot_screen()` / `snapshot_scrollback()` for rendered views.
 
 State interpretation uses heuristics by default. If the MCP client advertises
@@ -52,8 +52,12 @@ ESC_RE = re.compile(
 )
 
 
-def _clamp_tool_timeout(timeout: float) -> float:
-    return min(timeout, MAX_TOOL_TIMEOUT_S)
+def _validate_deadline_s(deadline_s: float) -> float:
+    if deadline_s < 0:
+        raise ValueError("deadline_s must be non-negative")
+    if deadline_s > MAX_TOOL_TIMEOUT_S:
+        raise ValueError(f"deadline_s exceeds max {MAX_TOOL_TIMEOUT_S:g}s")
+    return float(deadline_s)
 
 
 def _maybe_strip_ansi(text: str, *, strip_ansi: bool) -> str:
@@ -147,7 +151,6 @@ async def _build_stream_response(
     session: PTY,
     ctx: Context | None,
     result: dict,
-    strip_ansi: bool,
     output: str | None = None,
     extra: dict | None = None,
 ) -> dict:
@@ -156,7 +159,7 @@ async def _build_stream_response(
         "outcome": _outcome_from_result_status(result.get("status")),
         "terminal_state": terminal_state,
         "state_reason": state_reason,
-        "output": _maybe_strip_ansi(result.get("output", "") if output is None else output, strip_ansi=strip_ansi),
+        "output": _maybe_strip_ansi(result.get("output", "") if output is None else output, strip_ansi=True),
         "output_truncated": bool(result.get("output_truncated", False)),
         "dropped_bytes": int(result.get("dropped_bytes", 0)),
     }
@@ -588,15 +591,6 @@ async def create_session(
             description="Free-form description of what this session is doing (for humans). Does not affect execution."
         ),
     ] = None,
-    shell_prompt_regex: Annotated[
-        str | None,
-        Field(
-            description=(
-                "Optional regex used to detect when the terminal is idle at a shell prompt. "
-                "Matched against the last visible non-empty screen line. Prefer anchoring to the end."
-            )
-        ),
-    ] = None,
     ctx: Context | None = None,
 ) -> dict:
     """Create a PTY session with an explicit working directory.
@@ -608,10 +602,6 @@ async def create_session(
         session_id: Stable identifier for this PTY session.
         cwd: Working directory for the session's shell.
         description: Free-form description of what this session is doing (for humans).
-        shell_prompt_regex: Optional regex to detect a shell prompt on the last visible
-            non-empty screen line. Use this only for shell prompt detection, not the LLM prompt.
-            Prefer anchoring to the end of the prompt (e.g. `r\"\\$\\s*$\"`). Set it after
-            observing the actual prompt text if the default heuristics misclassify READY as RUNNING.
     """
     if session_id in getattr(session_manager, "_terminated", set()):
         return {"outcome": "terminated", "terminal_state": None, "created": False, "state_reason": ""}
@@ -628,7 +618,6 @@ async def create_session(
             session_manager.configure_full(
                 session_id,
                 description=description,
-                shell_prompt_regex=shell_prompt_regex,
             )
             session = session_manager.get_session(session_id, cwd=abs_cwd)
         except RuntimeError:
@@ -645,7 +634,6 @@ async def create_session(
         session_manager.configure_full(
             session_id,
             description=description,
-            shell_prompt_regex=shell_prompt_regex,
         )
         created = False
         created_reason = "session already exists"
@@ -667,9 +655,14 @@ async def create_session(
 async def send_line(
     session_id: str,
     line: str,
-    deadline_s: float = 30.0,
-    quiet_ms: int = QUIESCENCE_MS,
-    strip_ansi: bool = True,
+    deadline_s: Annotated[
+        float,
+        Field(
+            ge=0,
+            le=MAX_TOOL_TIMEOUT_S,
+            description="Total wall-clock budget in seconds. Must be between 0 and 300.",
+        ),
+    ] = 30.0,
     ctx: Context | None = None,
 ) -> dict:
     """Send one newline-terminated line to a stateful PTY session.
@@ -677,15 +670,17 @@ async def send_line(
     Requires an existing session created via `create_session(session_id, cwd)`.
 
     After sending `line + "\\n"`, this drains newly produced PTY bytes until the
-    PTY is silent for `quiet_ms` milliseconds or until `deadline_s` expires.
+    PTY is silent for `PILOTY_QUIESCENCE_MS` (default 1000ms) or until
+    `deadline_s` expires.
 
-    `deadline_s` is capped at 300 seconds.
+    `deadline_s` must be at most 300 seconds.
 
     Common SSH pattern:
     - create_session(session_id, cwd)
     - send_line(session_id, "ssh host", deadline_s=2)
     - wait_for_shell_prompt(session_id, deadline_s=30)
     """
+    deadline_s = _validate_deadline_s(deadline_s)
     if session_id in getattr(session_manager, "_terminated", set()):
         return {
             "outcome": "terminated",
@@ -716,18 +711,22 @@ async def send_line(
             "state_reason": "",
         }
 
-    deadline_s = _clamp_tool_timeout(deadline_s)
-    result = await asyncio.to_thread(session.type, line + "\n", timeout=deadline_s, quiescence_ms=quiet_ms)
-    return await _build_stream_response(session=session, ctx=ctx, result=result, strip_ansi=strip_ansi)
+    result = await asyncio.to_thread(session.type, line + "\n", timeout=deadline_s, quiescence_ms=QUIESCENCE_MS)
+    return await _build_stream_response(session=session, ctx=ctx, result=result)
 
 
 @mcp.tool()
 async def send_text(
     session_id: str,
     text: str,
-    deadline_s: float = 30.0,
-    quiet_ms: int = QUIESCENCE_MS,
-    strip_ansi: bool = True,
+    deadline_s: Annotated[
+        float,
+        Field(
+            ge=0,
+            le=MAX_TOOL_TIMEOUT_S,
+            description="Total wall-clock budget in seconds. Must be between 0 and 300.",
+        ),
+    ] = 30.0,
     ctx: Context | None = None,
 ) -> dict:
     """Send raw text to a stateful PTY session without adding a newline.
@@ -735,10 +734,12 @@ async def send_text(
     Requires an existing session created via `create_session(session_id, cwd)`.
 
     After sending `text`, this drains newly produced PTY bytes until the PTY is
-    silent for `quiet_ms` milliseconds or until `deadline_s` expires.
+    silent for `PILOTY_QUIESCENCE_MS` (default 1000ms) or until `deadline_s`
+    expires.
 
-    `deadline_s` is capped at 300 seconds.
+    `deadline_s` must be at most 300 seconds.
     """
+    deadline_s = _validate_deadline_s(deadline_s)
     if session_id in getattr(session_manager, "_terminated", set()):
         return {
             "outcome": "terminated",
@@ -769,17 +770,22 @@ async def send_text(
             "state_reason": "",
         }
 
-    deadline_s = _clamp_tool_timeout(deadline_s)
-    result = await asyncio.to_thread(session.type, text, timeout=deadline_s, quiescence_ms=quiet_ms)
-    return await _build_stream_response(session=session, ctx=ctx, result=result, strip_ansi=strip_ansi)
+    result = await asyncio.to_thread(session.type, text, timeout=deadline_s, quiescence_ms=QUIESCENCE_MS)
+    return await _build_stream_response(session=session, ctx=ctx, result=result)
 
 
 @mcp.tool()
 async def send_password(
     session_id: str,
     password: str,
-    deadline_s: float = 30.0,
-    quiet_ms: int = QUIESCENCE_MS,
+    deadline_s: Annotated[
+        float,
+        Field(
+            ge=0,
+            le=MAX_TOOL_TIMEOUT_S,
+            description="Total wall-clock budget in seconds. Must be between 0 and 300.",
+        ),
+    ] = 30.0,
     ctx: Context | None = None,
 ) -> dict:
     """Send a password plus newline.
@@ -793,10 +799,12 @@ async def send_password(
       redaction, prefixed by `[password sent]`.
 
     After sending `password + "\\n"`, this drains newly produced PTY bytes until
-    the PTY is silent for `quiet_ms` milliseconds or until `deadline_s` expires.
+    the PTY is silent for `PILOTY_QUIESCENCE_MS` (default 1000ms) or until
+    `deadline_s` expires.
 
-    `deadline_s` is capped at 300 seconds.
+    `deadline_s` must be at most 300 seconds.
     """
+    deadline_s = _validate_deadline_s(deadline_s)
     if session_id in getattr(session_manager, "_terminated", set()):
         return {
             "outcome": "terminated",
@@ -827,13 +835,11 @@ async def send_password(
             "state_reason": "",
         }
 
-    deadline_s = _clamp_tool_timeout(deadline_s)
-
     result = await asyncio.to_thread(
         session.type,
         password + "\n",
         timeout=deadline_s,
-        quiescence_ms=quiet_ms,
+        quiescence_ms=QUIESCENCE_MS,
         log=False,
         echo=False,
     )
@@ -845,16 +851,21 @@ async def send_password(
         out = "[password sent]\n" + redacted
     else:
         out = "[password sent]"
-    return await _build_stream_response(session=session, ctx=ctx, result=result, strip_ansi=False, output=out)
+    return await _build_stream_response(session=session, ctx=ctx, result=result, output=out)
 
 
 @mcp.tool()
 async def send_control(
     session_id: str,
     key: str,
-    deadline_s: float = 5.0,
-    quiet_ms: int = QUIESCENCE_MS,
-    strip_ansi: bool = True,
+    deadline_s: Annotated[
+        float,
+        Field(
+            ge=0,
+            le=MAX_TOOL_TIMEOUT_S,
+            description="Total wall-clock budget in seconds. Must be between 0 and 300.",
+        ),
+    ] = 5.0,
     ctx: Context | None = None,
 ) -> dict:
     """Send a control character to the terminal.
@@ -869,11 +880,12 @@ async def send_control(
     - `[` or `escape` sends ESC.
 
     After sending the control character, this drains newly produced PTY bytes
-    until the PTY is silent for `quiet_ms` milliseconds or until `deadline_s`
-    expires.
+    until the PTY is silent for `PILOTY_QUIESCENCE_MS` (default 1000ms) or until
+    `deadline_s` expires.
 
-    `deadline_s` is capped at 300 seconds.
+    `deadline_s` must be at most 300 seconds.
     """
+    deadline_s = _validate_deadline_s(deadline_s)
     if session_id in getattr(session_manager, "_terminated", set()):
         return {
             "outcome": "terminated",
@@ -913,17 +925,21 @@ async def send_control(
     else:
         raise ValueError(f"Unknown control key: {key}")
 
-    deadline_s = _clamp_tool_timeout(deadline_s)
-    result = await asyncio.to_thread(session.type, char, timeout=deadline_s, quiescence_ms=quiet_ms)
-    return await _build_stream_response(session=session, ctx=ctx, result=result, strip_ansi=strip_ansi)
+    result = await asyncio.to_thread(session.type, char, timeout=deadline_s, quiescence_ms=QUIESCENCE_MS)
+    return await _build_stream_response(session=session, ctx=ctx, result=result)
 
 
 @mcp.tool()
 async def wait_for_output(
     session_id: str,
-    deadline_s: float = 30.0,
-    quiet_ms: int = QUIESCENCE_MS,
-    strip_ansi: bool = True,
+    deadline_s: Annotated[
+        float,
+        Field(
+            ge=0,
+            le=MAX_TOOL_TIMEOUT_S,
+            description="Total wall-clock budget in seconds. Must be between 0 and 300.",
+        ),
+    ] = 30.0,
     ctx: Context | None = None,
 ) -> dict:
     """Wait for newly arriving PTY output without sending input.
@@ -931,16 +947,17 @@ async def wait_for_output(
     Requires an existing session created via `create_session(session_id, cwd)`.
 
     This waits for new PTY bytes to arrive. After the first new output is
-    observed, it continues draining until the PTY is silent for `quiet_ms`
-    milliseconds or until `deadline_s` expires.
+    observed, it continues draining until the PTY is silent for
+    `PILOTY_QUIESCENCE_MS` (default 1000ms) or until `deadline_s` expires.
 
-    `deadline_s` is capped at 300 seconds. If the deadline expires after some
+    `deadline_s` must be at most 300 seconds. If the deadline expires after some
     output has already been captured, partial output is returned with
     `outcome="deadline_exceeded"`.
 
     If you need to wait specifically for a shell prompt, use
     `wait_for_shell_prompt()`.
     """
+    deadline_s = _validate_deadline_s(deadline_s)
     if session_id in getattr(session_manager, "_terminated", set()):
         return {
             "outcome": "terminated",
@@ -971,9 +988,8 @@ async def wait_for_output(
             "state_reason": "",
         }
 
-    deadline_s = _clamp_tool_timeout(deadline_s)
-    result = await asyncio.to_thread(session.poll_output, timeout=deadline_s, quiescence_ms=quiet_ms)
-    return await _build_stream_response(session=session, ctx=ctx, result=result, strip_ansi=strip_ansi)
+    result = await asyncio.to_thread(session.poll_output, timeout=deadline_s, quiescence_ms=QUIESCENCE_MS)
+    return await _build_stream_response(session=session, ctx=ctx, result=result)
 
 
 @mcp.tool()
@@ -1029,7 +1045,6 @@ async def snapshot_screen(session_id: str, ctx: Context | None = None) -> dict:
 async def snapshot_scrollback(
     session_id: str,
     lines: int = 200,
-    strip_ansi: bool = False,
     ctx: Context | None = None,
 ) -> dict:
     """Get rendered terminal scrollback.
@@ -1061,7 +1076,6 @@ async def snapshot_scrollback(
     snap = await asyncio.to_thread(session.screen_snapshot, drain=False)
     terminal_state, reason = await _describe_terminal(session, ctx)
     scrollback = await asyncio.to_thread(session.get_scrollback, lines, drain=False)
-    scrollback = _maybe_strip_ansi(scrollback, strip_ansi=strip_ansi)
     return {
         "outcome": "success",
         "terminal_state": terminal_state,
@@ -1093,23 +1107,25 @@ async def clear_scrollback(session_id: str, ctx: Context | None = None) -> dict:
 async def wait_for_regex(
     session_id: str,
     pattern: str,
-    deadline_s: float = 30.0,
-    search_scope: str = "visible_or_new",
-    strip_ansi: bool = True,
+    deadline_s: Annotated[
+        float,
+        Field(
+            ge=0,
+            le=MAX_TOOL_TIMEOUT_S,
+            description="Total wall-clock budget in seconds. Must be between 0 and 300.",
+        ),
+    ] = 30.0,
     ctx: Context | None = None,
 ) -> dict:
     """Wait for a regex match in rendered text and/or newly arriving PTY bytes.
 
     Requires an existing session created via `create_session(session_id, cwd)`.
 
-    `search_scope` controls where matching begins:
-    - `visible_or_new`: check already rendered scrollback first, then wait on new PTY output.
-    - `new_only`: ignore already visible text and wait only on new PTY output.
+    This first checks already rendered scrollback, then waits on new PTY output.
 
-    `deadline_s` is capped at 300 seconds.
+    `deadline_s` must be at most 300 seconds.
     """
-    if search_scope not in {"visible_or_new", "new_only"}:
-        raise ValueError("search_scope must be one of: visible_or_new, new_only")
+    deadline_s = _validate_deadline_s(deadline_s)
     if session_id in getattr(session_manager, "_terminated", set()):
         return {
             "outcome": "terminated",
@@ -1157,31 +1173,28 @@ async def wait_for_regex(
     except re.error as e:
         raise ValueError(f"re.error: {e}")
 
-    if search_scope == "visible_or_new":
-        visible = await asyncio.to_thread(session.get_scrollback, 5000, log=False, drain=False)
-        visible_match = rx.search(visible)
-        if visible_match:
-            terminal_state, reason = await _describe_terminal(session, ctx)
-            return {
-                "outcome": "success",
-                "terminal_state": terminal_state,
-                "output": "",
-                "matched": True,
-                "match": visible_match.group(0),
-                "groups": list(visible_match.groups()),
-                "match_source": "visible",
-                "output_truncated": False,
-                "dropped_bytes": 0,
-                "state_reason": f"matched on rendered text: {reason}",
-            }
+    visible = await asyncio.to_thread(session.get_scrollback, 5000, log=False, drain=False)
+    visible_match = rx.search(visible)
+    if visible_match:
+        terminal_state, reason = await _describe_terminal(session, ctx)
+        return {
+            "outcome": "success",
+            "terminal_state": terminal_state,
+            "output": "",
+            "matched": True,
+            "match": visible_match.group(0),
+            "groups": list(visible_match.groups()),
+            "match_source": "visible",
+            "output_truncated": False,
+            "dropped_bytes": 0,
+            "state_reason": f"matched on rendered text: {reason}",
+        }
 
-    deadline_s = _clamp_tool_timeout(deadline_s)
     result = await asyncio.to_thread(session.expect, pattern, deadline_s)
     resp = await _build_stream_response(
         session=session,
         ctx=ctx,
         result=result,
-        strip_ansi=strip_ansi,
         extra={
             "matched": result.get("status") == "matched",
             "match": result.get("match"),
@@ -1195,9 +1208,14 @@ async def wait_for_regex(
 @mcp.tool()
 async def wait_for_shell_prompt(
     session_id: str,
-    deadline_s: float = 30.0,
-    quiet_ms: int = QUIESCENCE_MS,
-    strip_ansi: bool = True,
+    deadline_s: Annotated[
+        float,
+        Field(
+            ge=0,
+            le=MAX_TOOL_TIMEOUT_S,
+            description="Total wall-clock budget in seconds. Must be between 0 and 300.",
+        ),
+    ] = 30.0,
     ctx: Context | None = None,
 ) -> dict:
     """Wait until a shell prompt is detected.
@@ -1209,11 +1227,11 @@ async def wait_for_shell_prompt(
     during that wait is returned in `output`.
 
     If the remote shell uses a customized prompt that the default heuristics
-    misclassify, set `shell_prompt_regex` via `configure_session(...)` or
-    `create_session(...)`.
+    misclassify, set `shell_prompt_regex` via `configure_session(...)`.
 
-    `deadline_s` is capped at 300 seconds.
+    `deadline_s` must be at most 300 seconds.
     """
+    deadline_s = _validate_deadline_s(deadline_s)
     if session_id in getattr(session_manager, "_terminated", set()):
         return {
             "outcome": "terminated",
@@ -1248,7 +1266,6 @@ async def wait_for_shell_prompt(
             "state_reason": reason,
         }
 
-    deadline_s = _clamp_tool_timeout(deadline_s)
     deadline = time.monotonic() + deadline_s
     chunks: list[str] = []
     dropped_bytes = 0
@@ -1260,7 +1277,7 @@ async def wait_for_shell_prompt(
             return {
                 "outcome": "deadline_exceeded",
                 "terminal_state": terminal_state,
-                "output": _maybe_strip_ansi("".join(chunks), strip_ansi=strip_ansi),
+                "output": _maybe_strip_ansi("".join(chunks), strip_ansi=True),
                 "prompt_detected": False,
                 "output_truncated": output_truncated,
                 "dropped_bytes": dropped_bytes,
@@ -1270,7 +1287,7 @@ async def wait_for_shell_prompt(
         poll_result = await asyncio.to_thread(
             session.poll_output,
             timeout=min(0.25, remaining),
-            quiescence_ms=quiet_ms,
+            quiescence_ms=QUIESCENCE_MS,
         )
         chunk = poll_result.get("output", "")
         if chunk:
@@ -1283,7 +1300,7 @@ async def wait_for_shell_prompt(
             return {
                 "outcome": "success",
                 "terminal_state": terminal_state,
-                "output": _maybe_strip_ansi("".join(chunks), strip_ansi=strip_ansi),
+                "output": _maybe_strip_ansi("".join(chunks), strip_ansi=True),
                 "prompt_detected": True,
                 "output_truncated": output_truncated,
                 "dropped_bytes": dropped_bytes,
@@ -1293,7 +1310,7 @@ async def wait_for_shell_prompt(
             return {
                 "outcome": "eof",
                 "terminal_state": None,
-                "output": _maybe_strip_ansi("".join(chunks), strip_ansi=strip_ansi),
+                "output": _maybe_strip_ansi("".join(chunks), strip_ansi=True),
                 "prompt_detected": False,
                 "output_truncated": output_truncated,
                 "dropped_bytes": dropped_bytes,
@@ -1303,7 +1320,7 @@ async def wait_for_shell_prompt(
             return {
                 "outcome": "error",
                 "terminal_state": terminal_state,
-                "output": _maybe_strip_ansi("".join(chunks), strip_ansi=strip_ansi),
+                "output": _maybe_strip_ansi("".join(chunks), strip_ansi=True),
                 "prompt_detected": False,
                 "output_truncated": output_truncated,
                 "dropped_bytes": dropped_bytes,
@@ -1444,15 +1461,21 @@ async def configure_session(
 async def send_signal(
     session_id: str,
     signal: str,
-    deadline_s: float = 5.0,
-    quiet_ms: int = QUIESCENCE_MS,
-    strip_ansi: bool = True,
+    deadline_s: Annotated[
+        float,
+        Field(
+            ge=0,
+            le=MAX_TOOL_TIMEOUT_S,
+            description="Total wall-clock budget in seconds. Must be between 0 and 300.",
+        ),
+    ] = 5.0,
     ctx: Context | None = None,
 ) -> dict:
     """Send an OS signal to the foreground process in a session.
 
     Requires an existing session created via `create_session(session_id, cwd)`.
     """
+    deadline_s = _validate_deadline_s(deadline_s)
     if session_id in getattr(session_manager, "_terminated", set()):
         return {
             "outcome": "terminated",
@@ -1496,9 +1519,8 @@ async def send_signal(
             raise ValueError(f"Unknown signal: {signal!r}")
         signum = int(signum)
 
-    deadline_s = _clamp_tool_timeout(deadline_s)
-    result = await asyncio.to_thread(session.send_signal, signum, deadline_s, True, quiet_ms)
-    return await _build_stream_response(session=session, ctx=ctx, result=result, strip_ansi=strip_ansi)
+    result = await asyncio.to_thread(session.send_signal, signum, deadline_s, True, QUIESCENCE_MS)
+    return await _build_stream_response(session=session, ctx=ctx, result=result)
 
 
 @mcp.tool()
